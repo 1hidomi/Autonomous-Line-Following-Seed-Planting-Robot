@@ -1,4 +1,4 @@
-'''
+/*
 [platformio]
 default_envs = giga_r1_m7
 
@@ -73,7 +73,7 @@ build_src_filter =
 
 lib_deps =
   kkloesener/MFRC522_I2C
-'''
+*/
 // VERSION: LINE_FOLLOWER_FIXED_LEFT_THEN_CROSS_RIGHT_REVERSED_FIND_V2
 // Loaded from saved_versions/line_follower_working_2026-05-19.cpp.
 // Current test changes: fixed route, first left 90, then right 90 at intersection.
