@@ -1,0 +1,2486 @@
+/*
+------------bash------------
+/Users/admin/.platformio/penv/bin/platformio run --target upload
+/Users/admin/.platformio/penv/bin/platformio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
+---------command------------
+HELP
+STATUS
+PARAMS
+GET line_threshold
+SET line_threshold 810
+SET forward_speed 850
+SET right_angle_target_deg 88
+STOP
+RUN
+--------headfile------------
+[platformio]
+default_envs = giga_r1_m7
+
+[env:giga_r1_m7]
+platform = ststm32
+board = giga_r1_m7
+framework = arduino
+upload_protocol = dfu
+board_upload.disable_flushing = true
+monitor_port = /dev/cu.usbmodem101
+monitor_speed = 115200
+
+build_src_filter =
+  +<main.cpp>
+  -<KillS_Reflectance_bend.cpp>
+  -<Test_reflectance.cpp>
+  -<Test_encoder.cpp>
+  -<US.cpp>
+  -<IMU.cpp>
+
+lib_deps =
+  https://github.com/pololu/motoron-arduino.git
+  kkloesener/MFRC522_I2C
+  sparkfun/SparkFun 9DoF IMU Breakout - ICM 20948 - Arduino Library
+  arduino-libraries/ArduinoMqttClient
+  alexandros-charitonidis/MiniMessenger
+
+[env:rfid_test]
+platform = ststm32
+board = giga_r1_m7
+framework = arduino
+upload_protocol = dfu
+monitor_port = /dev/cu.usbmodem101
+monitor_speed = 115200
+
+build_src_filter =
+  +<main.cpp>
+  -<RFID.cpp>
+  -<main.c>
+  -<KillS_Reflectance_bend.cpp>
+  -<Test_reflectance.cpp>
+  -<Test_encoder.cpp>
+  -<US.cpp>
+  -<IMU.cpp>
+
+lib_deps =
+  kkloesener/MFRC522_I2C
+
+[env:rfid_uno_r4_wifi]
+platform = renesas-ra
+board = uno_r4_wifi
+framework = arduino
+monitor_speed = 115200
+
+build_src_filter =
+  +<RFID_UNO_R4.cpp>
+  -<main.cpp>
+  -<RFID.cpp>
+
+lib_deps =
+  kkloesener/MFRC522_I2C
+
+[env:rfid_uno_r4_minima]
+platform = renesas-ra
+board = uno_r4_minima
+framework = arduino
+monitor_speed = 115200
+
+build_src_filter =
+  +<RFID_UNO_R4.cpp>
+  -<main.cpp>
+  -<RFID.cpp>
+
+lib_deps =
+  kkloesener/MFRC522_I2C
+---------main---------------
+*/
+// VERSION: LINE_FOLLOWER_FIXED_LEFT_THEN_CROSS_RIGHT_REVERSED_FIND_V2
+// Loaded from saved_versions/line_follower_working_2026-05-19.cpp.
+// Current test changes: fixed route, first left 90, then right 90 at intersection.
+// Find-line swing order after turns is reversed from the previous test.
+
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+#include <Motoron.h>
+#include <MFRC522_I2C.h>
+#include <MiniMessenger.h>
+#include "ICM_20948.h"
+#include "secrets.h"
+
+const uint8_t LOWER_MOTORON_ADDR = 0x10;
+const uint8_t UPPER_MOTORON_ADDR = 0x11;
+
+MotoronI2C mcLower(LOWER_MOTORON_ADDR);
+MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
+MiniMessenger messenger;
+
+// ICM-20948 on SDA/SCL, D20/D21.
+ICM_20948_I2C imu;
+bool imuAd0Val = true;
+float gyroZBias = 0.0;
+float yawDeg = 0.0;
+float turnStartYawDeg = 0.0;
+unsigned long lastUpdateMicros = 0;
+
+// Lower shield: RF/RR/LR on M1/M2/M3.
+// Upper shield: LF on M1.
+const uint8_t RF = 1;
+const uint8_t RR = 2;
+const uint8_t LR = 3;
+const uint8_t LF = 1;
+
+// Raw Motoron polarity for physical forward motion.
+const int8_t FWD_RF = 1;
+const int8_t FWD_RR = 1;
+const int8_t FWD_LR = -1;
+const int8_t FWD_LF = -1;
+
+// QTR order: RIGHT, SLIGHT_RIGHT, MIDDLE, SLIGHT_LEFT, LEFT.
+const uint8_t SENSOR_COUNT = 5;
+const uint8_t SENSOR_PINS[SENSOR_COUNT] = {22, 24, 26, 28, 31};
+
+// Saved final wiring map for later encoder work.
+const uint8_t ENC_A[4] = {2, 4, 6, 8};
+const uint8_t ENC_B[4] = {3, 5, 7, 9};
+
+// Trial 1 ultrasonic wiring.
+const uint8_t US_FRONT_ECHO = 37;
+const uint8_t US_FRONT_TRIG = 39;
+const uint8_t US_LEFT_ECHO = 52;
+const uint8_t US_LEFT_TRIG = 44;
+const uint8_t US_RIGHT_ECHO = 46;
+const uint8_t US_RIGHT_TRIG = 48;
+const uint8_t REVIVE_BUTTON_PIN = 32;
+const uint8_t KILL_BUTTON_PIN = 45;
+const uint8_t LED_RED_PIN = 36;
+const uint8_t LED_GREEN_PIN = 38;
+
+const unsigned int SENSOR_TIMEOUT_US = 3000;
+unsigned int LINE_THRESHOLD = 760;
+unsigned int STRONG_SIDE_CORRECTION_THRESHOLD = 1100;
+const int SIDE_DOMINANCE_MARGIN = 60;
+const bool BLACK_LINE_IS_HIGH = true;
+
+const bool SENSOR_DEBUG_MODE = false;
+const bool ENABLE_LINE_CORRECTION = true;
+const bool ENABLE_ROUTE_TURNS = false;
+const bool USE_WIFI_KILL = true;
+const bool REQUIRE_DASHBOARD_ENABLE = false;
+const bool USE_RFID = true;
+const unsigned long REGISTER_INTERVAL_MS = 10000;
+
+const int16_t MAX_SPEED = 1200;
+const int16_t MIN_MOTOR_SPEED = 700;
+const int16_t CENTER_FORWARD_SPEED = 1000;
+const int16_t CENTER_TRIM_SPEED = 180;
+const int CENTER_TRIM_THRESHOLD = 80;
+int16_t FORWARD_SPEED = 800;
+const int16_t MIN_CORRECTION_SPEED = 700;
+int16_t PIVOT_SPEED = 1200;
+int16_t RIGHT_ANGLE_FAST_SPEED = 1200;
+int16_t RIGHT_ANGLE_SLOW_SPEED = 800;
+
+uint16_t FORWARD_PULSE_MS = 200;
+const uint16_t SENSOR_SETTLE_MS = 15;
+const uint16_t PRE_CORRECT_STOP_MS = 45;
+uint16_t CORRECTION_PULSE_MS = 140;
+uint16_t STRONG_CORRECTION_PULSE_MS = 200;
+const uint16_t AFTER_CORRECT_SETTLE_MS = 35;
+const float PRE_TURN_FORWARD_CM = 11.0;
+const float PRE_TURN_MS_PER_CM_AT_SPEED_700 = 55.6;
+const uint16_t PRE_TURN_FORWARD_MS = (uint16_t)(PRE_TURN_FORWARD_CM * PRE_TURN_MS_PER_CM_AT_SPEED_700 + 0.5);
+const uint16_t AFTER_TURN_SETTLE_MS = 120;
+const uint16_t RIGHT_ANGLE_TIMEOUT_MS = 5000;
+float RIGHT_ANGLE_TARGET_DEG = 88.0;
+const uint16_t OBSTACLE_RIGHT_ANGLE_TIMEOUT_MS = RIGHT_ANGLE_TIMEOUT_MS;
+float OBSTACLE_RIGHT_ANGLE_TARGET_DEG = 88.0;
+float RIGHT_ANGLE_SLOW_DOWN_DEG = 70.0;
+const int16_t FIND_LINE_SPEED = 1200;
+uint16_t FIND_LINE_SMALL_MS = 220;
+uint16_t FIND_LINE_BIG_MS = 650;
+const uint16_t RECOVERY_FORWARD_MS = 120;
+const uint16_t RECOVERY_STOP_MS = 70;
+const uint16_t RECOVERY_SWING_MS = 180;
+float OBSTACLE_WARN_CM = 20.0;
+float FRONT_OBSTACLE_STOP_CM = 10.0;
+const float SIDE_OBSTACLE_CLEAR_CM = 10.0;
+float WALL_TARGET_CM = 15.0;
+float WALL_TOLERANCE_CM = 3.0;
+uint16_t SNAKE_CELL_FORWARD_MS = 1200;
+int16_t SNAKE_TURN_DIRECTION = 1;
+const uint32_t ULTRASONIC_TIMEOUT_US = 25000;
+const unsigned long ULTRASONIC_SENSOR_GAP_MS = 60;
+const unsigned long SENSOR_STATUS_INTERVAL_MS = 1000;
+const unsigned long DEBUG_PRINT_INTERVAL_MS = 1000;
+const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
+const unsigned long RFID_CHECK_INTERVAL_MS = 80;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long KILL_BLINK_MS = 250;
+
+const uint8_t RFID_I2C_ADDR = 0x28;
+const uint8_t RFID_UNUSED_RESET_PIN = 0xFF;
+MFRC522_I2C mfrc522(RFID_I2C_ADDR, RFID_UNUSED_RESET_PIN, &Wire1);
+
+struct UltrasonicSensor
+{
+  const char *name;
+  uint8_t trigPin;
+  uint8_t echoPin;
+  float distanceCm;
+};
+
+struct DebouncedButton
+{
+  uint8_t pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastChangeMs;
+};
+
+UltrasonicSensor ultrasonicSensors[] = {
+    {"Front", US_FRONT_TRIG, US_FRONT_ECHO, -1.0},
+    {"Left", US_LEFT_TRIG, US_LEFT_ECHO, -1.0},
+    {"Right", US_RIGHT_TRIG, US_RIGHT_ECHO, -1.0},
+};
+
+const uint8_t NUM_ULTRASONIC = sizeof(ultrasonicSensors) / sizeof(ultrasonicSensors[0]);
+
+unsigned int sensorValues[SENSOR_COUNT];
+bool sensorOnLine[SENSOR_COUNT];
+int16_t currentMotorRf = 0;
+int16_t currentMotorRr = 0;
+int16_t currentMotorLr = 0;
+int16_t currentMotorLf = 0;
+int16_t lastPrintedMotorRf = 32767;
+int16_t lastPrintedMotorRr = 32767;
+int16_t lastPrintedMotorLr = 32767;
+int16_t lastPrintedMotorLf = 32767;
+
+int lastDirection = 0; // -1 = left, 0 = center/unknown, 1 = right
+int correctionDirection = 0;
+uint16_t activeCorrectionPulseMs = CORRECTION_PULSE_MS;
+unsigned long stateStartMs = 0;
+unsigned long lastPrintMs = 0;
+bool killStopped = REQUIRE_DASHBOARD_ENABLE;
+bool serialStopActive = false;
+bool rfidReady = false;
+bool isRevived = false;
+bool redBlinkEnabled = false;
+bool blinkRedOn = false;
+unsigned long killPauseStartMs = 0;
+unsigned long lastRegisterMs = 0;
+unsigned long lastSensorStatusMs = 0;
+unsigned long lastUltrasonicReadMs = 0;
+unsigned long lastRFIDRetryMs = 0;
+unsigned long lastRFIDCheckMs = 0;
+unsigned long lastBlinkMs = 0;
+unsigned long obstaclePauseStartMs = 0;
+unsigned long lastObstaclePrintMs = 0;
+uint8_t nextUltrasonicIndex = 0;
+unsigned long ignoreRightAngleUntilMs = 0;
+int lastTurnDirection = 0; // -1 = left, 1 = right
+uint8_t completedRouteTurns = 0;
+int pendingTurnDirection = 0; // -1 = left, 1 = right
+int findLineFirstDirection = 0; // -1 = left first, 1 = right first
+bool obstacleStopped = false;
+bool obstacleAvoidanceTurning = false;
+bool recoverySwingLeftFirst = true;
+DebouncedButton reviveButton = {REVIVE_BUTTON_PIN, HIGH, HIGH, 0};
+DebouncedButton killButton = {KILL_BUTTON_PIN, HIGH, HIGH, 0};
+
+enum RobotState
+{
+  SENSE_LINE,
+  FORWARD_PULSE,
+  SENSOR_SETTLE,
+  PRE_CORRECT_STOP,
+  CORRECT_LEFT,
+  CORRECT_RIGHT,
+  AFTER_CORRECT_SETTLE,
+  PRE_TURN_FORWARD_LEFT,
+  PRE_TURN_FORWARD_RIGHT,
+  TURN_LEFT_90,
+  TURN_RIGHT_90,
+  AFTER_TURN_SETTLE,
+  FIND_LINE_SMALL_LEFT,
+  FIND_LINE_SMALL_RIGHT,
+  FIND_LINE_BIG_LEFT,
+  FIND_LINE_BIG_RIGHT,
+  RECOVERY_FORWARD,
+  RECOVERY_STOP,
+  RECOVERY_SWING_LEFT,
+  RECOVERY_SWING_RIGHT,
+  LINE_LOST_STOP
+};
+
+RobotState state = SENSE_LINE;
+
+enum RobotMode
+{
+  MANUAL_STOP,
+  MANUAL_FORWARD,
+  MANUAL_TURN_LEFT,
+  MANUAL_TURN_RIGHT,
+  MANUAL_UTURN,
+  LINE_FOLLOW,
+  SNAKE_EXPLORE,
+  TARGET_NAV,
+  TEST_MODE
+};
+
+RobotMode robotMode = LINE_FOLLOW;
+
+void enterState(RobotState nextState);
+void printSensors(const char *label);
+bool initRFIDNoResetPin();
+bool frontObstacleTooClose();
+void setObstacleStopped(bool stopped);
+bool handleFrontObstacleAvoidance();
+void updateSerialConsole();
+void processCommand(const char *line, Print &out);
+void printDistanceTo(Print &out, float distanceCm);
+
+const char *robotModeName(RobotMode mode)
+{
+  switch (mode)
+  {
+    case MANUAL_STOP: return "MANUAL_STOP";
+    case MANUAL_FORWARD: return "MANUAL_FORWARD";
+    case MANUAL_TURN_LEFT: return "MANUAL_TURN_LEFT";
+    case MANUAL_TURN_RIGHT: return "MANUAL_TURN_RIGHT";
+    case MANUAL_UTURN: return "MANUAL_UTURN";
+    case LINE_FOLLOW: return "LINE_FOLLOW";
+    case SNAKE_EXPLORE: return "SNAKE_EXPLORE";
+    case TARGET_NAV: return "TARGET_NAV";
+    case TEST_MODE: return "TEST_MODE";
+  }
+  return "UNKNOWN";
+}
+
+const char *stateName(RobotState robotState)
+{
+  switch (robotState)
+  {
+    case SENSE_LINE: return "SENSE_LINE";
+    case FORWARD_PULSE: return "FORWARD_PULSE";
+    case SENSOR_SETTLE: return "SENSOR_SETTLE";
+    case PRE_CORRECT_STOP: return "PRE_CORRECT_STOP";
+    case CORRECT_LEFT: return "CORRECT_LEFT";
+    case CORRECT_RIGHT: return "CORRECT_RIGHT";
+    case AFTER_CORRECT_SETTLE: return "AFTER_CORRECT_SETTLE";
+    case PRE_TURN_FORWARD_LEFT: return "PRE_TURN_FORWARD_LEFT";
+    case PRE_TURN_FORWARD_RIGHT: return "PRE_TURN_FORWARD_RIGHT";
+    case TURN_LEFT_90: return "TURN_LEFT_90";
+    case TURN_RIGHT_90: return "TURN_RIGHT_90";
+    case AFTER_TURN_SETTLE: return "AFTER_TURN_SETTLE";
+    case FIND_LINE_SMALL_LEFT: return "FIND_LINE_SMALL_LEFT";
+    case FIND_LINE_SMALL_RIGHT: return "FIND_LINE_SMALL_RIGHT";
+    case FIND_LINE_BIG_LEFT: return "FIND_LINE_BIG_LEFT";
+    case FIND_LINE_BIG_RIGHT: return "FIND_LINE_BIG_RIGHT";
+    case RECOVERY_FORWARD: return "RECOVERY_FORWARD";
+    case RECOVERY_STOP: return "RECOVERY_STOP";
+    case RECOVERY_SWING_LEFT: return "RECOVERY_SWING_LEFT";
+    case RECOVERY_SWING_RIGHT: return "RECOVERY_SWING_RIGHT";
+    case LINE_LOST_STOP: return "LINE_LOST_STOP";
+  }
+  return "UNKNOWN";
+}
+
+enum ParamType
+{
+  PARAM_UINT16,
+  PARAM_INT16,
+  PARAM_UINT,
+  PARAM_FLOAT
+};
+
+struct RuntimeParam
+{
+  const char *name;
+  ParamType type;
+  void *value;
+  float minValue;
+  float maxValue;
+};
+
+RuntimeParam runtimeParams[] = {
+    {"line_threshold", PARAM_UINT, &LINE_THRESHOLD, 100, SENSOR_TIMEOUT_US},
+    {"strong_line_threshold", PARAM_UINT, &STRONG_SIDE_CORRECTION_THRESHOLD, 100, SENSOR_TIMEOUT_US},
+    {"forward_speed", PARAM_INT16, &FORWARD_SPEED, 0, MAX_SPEED},
+    {"pivot_speed", PARAM_INT16, &PIVOT_SPEED, MIN_MOTOR_SPEED, MAX_SPEED},
+    {"right_angle_fast_speed", PARAM_INT16, &RIGHT_ANGLE_FAST_SPEED, MIN_MOTOR_SPEED, MAX_SPEED},
+    {"right_angle_slow_speed", PARAM_INT16, &RIGHT_ANGLE_SLOW_SPEED, MIN_MOTOR_SPEED, MAX_SPEED},
+    {"right_angle_target_deg", PARAM_FLOAT, &RIGHT_ANGLE_TARGET_DEG, 30.0, 180.0},
+    {"right_angle_slow_down_deg", PARAM_FLOAT, &RIGHT_ANGLE_SLOW_DOWN_DEG, 10.0, 170.0},
+    {"forward_pulse_ms", PARAM_UINT16, &FORWARD_PULSE_MS, 20, 1500},
+    {"correction_pulse_ms", PARAM_UINT16, &CORRECTION_PULSE_MS, 20, 1000},
+    {"strong_correction_pulse_ms", PARAM_UINT16, &STRONG_CORRECTION_PULSE_MS, 20, 1200},
+    {"obstacle_warn_cm", PARAM_FLOAT, &OBSTACLE_WARN_CM, 2.0, 200.0},
+    {"obstacle_estop_cm", PARAM_FLOAT, &FRONT_OBSTACLE_STOP_CM, 2.0, 100.0},
+    {"wall_target_cm", PARAM_FLOAT, &WALL_TARGET_CM, 2.0, 100.0},
+    {"wall_tolerance_cm", PARAM_FLOAT, &WALL_TOLERANCE_CM, 0.5, 50.0},
+    {"snake_cell_forward_ms", PARAM_UINT16, &SNAKE_CELL_FORWARD_MS, 100, 10000},
+    {"snake_turn_direction", PARAM_INT16, &SNAKE_TURN_DIRECTION, -1, 1},
+    {"find_line_small_ms", PARAM_UINT16, &FIND_LINE_SMALL_MS, 20, 2000},
+    {"find_line_big_ms", PARAM_UINT16, &FIND_LINE_BIG_MS, 50, 4000},
+};
+
+const uint8_t RUNTIME_PARAM_COUNT = sizeof(runtimeParams) / sizeof(runtimeParams[0]);
+
+bool equalsIgnoreCase(const char *left, const char *right)
+{
+  while (*left != '\0' && *right != '\0')
+  {
+    char a = *left;
+    char b = *right;
+    if (a >= 'a' && a <= 'z')
+    {
+      a -= 'a' - 'A';
+    }
+    if (b >= 'a' && b <= 'z')
+    {
+      b -= 'a' - 'A';
+    }
+    if (a != b)
+    {
+      return false;
+    }
+    left++;
+    right++;
+  }
+
+  return *left == '\0' && *right == '\0';
+}
+
+long roundedLong(float value)
+{
+  return (long)(value >= 0.0 ? value + 0.5 : value - 0.5);
+}
+
+RuntimeParam *findParam(const char *name)
+{
+  for (uint8_t i = 0; i < RUNTIME_PARAM_COUNT; i++)
+  {
+    if (equalsIgnoreCase(name, runtimeParams[i].name))
+    {
+      return &runtimeParams[i];
+    }
+  }
+
+  return nullptr;
+}
+
+void printParamValue(const RuntimeParam &param, Print &out)
+{
+  switch (param.type)
+  {
+    case PARAM_UINT16:
+      out.print(*(uint16_t *)param.value);
+      break;
+    case PARAM_INT16:
+      out.print(*(int16_t *)param.value);
+      break;
+    case PARAM_UINT:
+      out.print(*(unsigned int *)param.value);
+      break;
+    case PARAM_FLOAT:
+      out.print(*(float *)param.value, 2);
+      break;
+  }
+}
+
+void printParam(const RuntimeParam &param, Print &out)
+{
+  out.print(param.name);
+  out.print(" = ");
+  printParamValue(param, out);
+  out.print("  range[");
+  out.print(param.minValue, 1);
+  out.print(", ");
+  out.print(param.maxValue, 1);
+  out.println("]");
+}
+
+void printAllParams(Print &out)
+{
+  for (uint8_t i = 0; i < RUNTIME_PARAM_COUNT; i++)
+  {
+    printParam(runtimeParams[i], out);
+  }
+}
+
+bool setParamValue(RuntimeParam &param, float value)
+{
+  if (value < param.minValue || value > param.maxValue)
+  {
+    return false;
+  }
+
+  switch (param.type)
+  {
+    case PARAM_UINT16:
+      *(uint16_t *)param.value = (uint16_t)roundedLong(value);
+      break;
+    case PARAM_INT16:
+      *(int16_t *)param.value = (int16_t)roundedLong(value);
+      break;
+    case PARAM_UINT:
+      *(unsigned int *)param.value = (unsigned int)roundedLong(value);
+      break;
+    case PARAM_FLOAT:
+      *(float *)param.value = value;
+      break;
+  }
+
+  if (equalsIgnoreCase(param.name, "right_angle_target_deg"))
+  {
+    OBSTACLE_RIGHT_ANGLE_TARGET_DEG = RIGHT_ANGLE_TARGET_DEG;
+  }
+
+  return true;
+}
+
+int16_t normalizeMotorSpeed(int16_t speed)
+{
+  if (speed == 0)
+  {
+    return 0;
+  }
+
+  speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
+
+  if (speed > 0 && speed < MIN_MOTOR_SPEED)
+  {
+    return MIN_MOTOR_SPEED;
+  }
+
+  if (speed < 0 && speed > -MIN_MOTOR_SPEED)
+  {
+    return -MIN_MOTOR_SPEED;
+  }
+
+  return speed;
+}
+
+void setMotorSpeeds(int16_t rf, int16_t rr, int16_t lr, int16_t lf)
+{
+  currentMotorRf = normalizeMotorSpeed(rf);
+  currentMotorRr = normalizeMotorSpeed(rr);
+  currentMotorLr = normalizeMotorSpeed(lr);
+  currentMotorLf = normalizeMotorSpeed(lf);
+
+  mcLower.setSpeed(RF, currentMotorRf);
+  mcLower.setSpeed(RR, currentMotorRr);
+  mcLower.setSpeed(LR, currentMotorLr);
+  mcUpper.setSpeed(LF, currentMotorLf);
+
+  if (currentMotorRf != lastPrintedMotorRf ||
+      currentMotorRr != lastPrintedMotorRr ||
+      currentMotorLr != lastPrintedMotorLr ||
+      currentMotorLf != lastPrintedMotorLf)
+  {
+    lastPrintedMotorRf = currentMotorRf;
+    lastPrintedMotorRr = currentMotorRr;
+    lastPrintedMotorLr = currentMotorLr;
+    lastPrintedMotorLf = currentMotorLf;
+
+    Serial.print("MOTOR | RF=");
+    Serial.print(currentMotorRf);
+    Serial.print(" RR=");
+    Serial.print(currentMotorRr);
+    Serial.print(" LR=");
+    Serial.print(currentMotorLr);
+    Serial.print(" LF=");
+    Serial.print(currentMotorLf);
+    Serial.print(" state=");
+    Serial.println(stateName(state));
+  }
+}
+
+void stopAllMotors()
+{
+  setMotorSpeeds(0, 0, 0, 0);
+}
+
+void beginButton(DebouncedButton &button)
+{
+  pinMode(button.pin, INPUT_PULLUP);
+  button.stableState = digitalRead(button.pin);
+  button.lastReading = button.stableState;
+  button.lastChangeMs = millis();
+}
+
+bool buttonPressed(DebouncedButton &button)
+{
+  bool reading = digitalRead(button.pin);
+  if (reading != button.lastReading)
+  {
+    button.lastChangeMs = millis();
+    button.lastReading = reading;
+  }
+
+  if ((millis() - button.lastChangeMs) > DEBOUNCE_MS && reading != button.stableState)
+  {
+    button.stableState = reading;
+    return button.stableState == LOW;
+  }
+
+  return false;
+}
+
+void updateLed()
+{
+  if (redBlinkEnabled)
+  {
+    if (millis() - lastBlinkMs >= KILL_BLINK_MS)
+    {
+      lastBlinkMs = millis();
+      blinkRedOn = !blinkRedOn;
+    }
+    digitalWrite(LED_RED_PIN, blinkRedOn ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    return;
+  }
+
+  digitalWrite(LED_RED_PIN, isRevived ? LOW : HIGH);
+  digitalWrite(LED_GREEN_PIN, isRevived ? HIGH : LOW);
+}
+
+void setKillStopped(bool stopped, const char *source)
+{
+  if (!stopped && serialStopActive && !equalsIgnoreCase(source, "Serial"))
+  {
+    stopAllMotors();
+    return;
+  }
+
+  if (stopped == killStopped)
+  {
+    if (stopped)
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  killStopped = stopped;
+  robotMode = killStopped ? MANUAL_STOP : LINE_FOLLOW;
+
+  Serial.print("KILL | ");
+  Serial.print(source);
+  Serial.print(" -> ");
+  Serial.println(killStopped ? "STOP" : "RUN");
+
+  if (killStopped)
+  {
+    isRevived = false;
+    redBlinkEnabled = true;
+    blinkRedOn = true;
+    lastBlinkMs = millis();
+    killPauseStartMs = millis();
+    stopAllMotors();
+  }
+  else if (killPauseStartMs != 0)
+  {
+    redBlinkEnabled = false;
+    stateStartMs += millis() - killPauseStartMs;
+    killPauseStartMs = 0;
+    lastUpdateMicros = micros();
+  }
+  else
+  {
+    redBlinkEnabled = false;
+    lastUpdateMicros = micros();
+  }
+}
+
+void setReviveLedGreen(const char *source)
+{
+  isRevived = true;
+  redBlinkEnabled = false;
+
+  Serial.print("REVIVE | ");
+  Serial.print(source);
+  Serial.println(" -> LED GREEN");
+}
+
+void printConsoleHelp(Print &out)
+{
+  out.println("Console commands:");
+  out.println("  HELP");
+  out.println("  STATUS");
+  out.println("  PARAMS");
+  out.println("  GET <name>");
+  out.println("  SET <name> <value>");
+  out.println("  STOP");
+  out.println("  RUN");
+}
+
+void printConsoleStatus(Print &out)
+{
+  out.print("Mode=");
+  out.print(robotModeName(robotMode));
+  out.print(" State=");
+  out.print(stateName(state));
+  out.print(" Kill=");
+  out.print(killStopped ? "STOP" : "RUN");
+  out.print(" Obstacle=");
+  out.print(frontObstacleTooClose() ? "YES" : "NO");
+  out.print(" MQTT=");
+  out.println(USE_WIFI_KILL ? (messenger.isConnected() ? "OK" : "NO") : "OFF");
+
+  out.print("QTR [R,SR,M,SL,L]=");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    out.print(sensorValues[i]);
+    out.print(sensorOnLine[i] ? "*" : " ");
+    if (i + 1 < SENSOR_COUNT)
+    {
+      out.print(",");
+    }
+  }
+  out.print(" threshold=");
+  out.print(LINE_THRESHOLD);
+  out.print(" strong=");
+  out.println(STRONG_SIDE_CORRECTION_THRESHOLD);
+
+  out.print("Yaw=");
+  out.print(yawDeg, 1);
+  out.print(" Front=");
+  printDistanceTo(out, ultrasonicSensors[0].distanceCm);
+  out.print("cm Left=");
+  printDistanceTo(out, ultrasonicSensors[1].distanceCm);
+  out.print("cm Right=");
+  printDistanceTo(out, ultrasonicSensors[2].distanceCm);
+  out.println("cm");
+
+  out.print("Motors RF=");
+  out.print(currentMotorRf);
+  out.print(" RR=");
+  out.print(currentMotorRr);
+  out.print(" LR=");
+  out.print(currentMotorLr);
+  out.print(" LF=");
+  out.println(currentMotorLf);
+
+  out.print("Key params: forward_speed=");
+  out.print(FORWARD_SPEED);
+  out.print(" pivot_speed=");
+  out.print(PIVOT_SPEED);
+  out.print(" turn_fast=");
+  out.print(RIGHT_ANGLE_FAST_SPEED);
+  out.print(" turn_slow=");
+  out.print(RIGHT_ANGLE_SLOW_SPEED);
+  out.print(" turn_target=");
+  out.print(RIGHT_ANGLE_TARGET_DEG, 1);
+  out.print(" obstacle_warn=");
+  out.print(OBSTACLE_WARN_CM, 1);
+  out.print(" obstacle_estop=");
+  out.println(FRONT_OBSTACLE_STOP_CM, 1);
+}
+
+void processCommand(const char *line, Print &out)
+{
+  char buffer[96];
+  strncpy(buffer, line, sizeof(buffer) - 1);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  char *command = strtok(buffer, " \t");
+  if (command == nullptr)
+  {
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "HELP"))
+  {
+    printConsoleHelp(out);
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "STATUS"))
+  {
+    printConsoleStatus(out);
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "PARAMS"))
+  {
+    printAllParams(out);
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "GET"))
+  {
+    char *name = strtok(nullptr, " \t");
+    if (name == nullptr)
+    {
+      out.println("ERR GET needs a parameter name.");
+      return;
+    }
+
+    RuntimeParam *param = findParam(name);
+    if (param == nullptr)
+    {
+      out.println("ERR unknown parameter.");
+      return;
+    }
+
+    printParam(*param, out);
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "SET"))
+  {
+    char *name = strtok(nullptr, " \t");
+    char *valueText = strtok(nullptr, " \t");
+    if (name == nullptr || valueText == nullptr)
+    {
+      out.println("ERR SET needs: SET <name> <value>");
+      return;
+    }
+
+    RuntimeParam *param = findParam(name);
+    if (param == nullptr)
+    {
+      out.println("ERR unknown parameter.");
+      return;
+    }
+
+    float value = atof(valueText);
+    if (!setParamValue(*param, value))
+    {
+      out.print("ERR value out of range for ");
+      out.println(param->name);
+      return;
+    }
+
+    out.print("OK ");
+    printParam(*param, out);
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "STOP"))
+  {
+    serialStopActive = true;
+    robotMode = MANUAL_STOP;
+    setKillStopped(true, "Serial");
+    out.println("OK STOP");
+    return;
+  }
+
+  if (equalsIgnoreCase(command, "RUN"))
+  {
+    serialStopActive = false;
+    robotMode = LINE_FOLLOW;
+    setKillStopped(false, "Serial");
+    out.println("OK RUN");
+    return;
+  }
+
+  out.println("ERR unknown command. Type HELP.");
+}
+
+void updateSerialConsole()
+{
+  static char lineBuffer[96];
+  static uint8_t lineLength = 0;
+
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+
+    if (c == '\r')
+    {
+      continue;
+    }
+
+    if (c == '\n')
+    {
+      lineBuffer[lineLength] = '\0';
+      processCommand(lineBuffer, Serial);
+      lineLength = 0;
+      continue;
+    }
+
+    if ((size_t)lineLength + 1 >= sizeof(lineBuffer))
+    {
+      lineLength = 0;
+      Serial.println("ERR command too long.");
+      continue;
+    }
+
+    lineBuffer[lineLength++] = c;
+  }
+}
+
+void updateButtons()
+{
+  if (digitalRead(REVIVE_BUTTON_PIN) == LOW)
+  {
+    setReviveLedGreen("D32 level");
+  }
+
+  if (buttonPressed(reviveButton))
+  {
+    setReviveLedGreen("D32");
+  }
+
+  if (buttonPressed(killButton))
+  {
+    setKillStopped(!killStopped, "Mechanical D45");
+  }
+}
+
+void handleTextCommand(String command, const char *source)
+{
+  command.trim();
+  command.toUpperCase();
+
+  if (command == "STOP" || command == "KILL" || command == "OFF" || command == "0")
+  {
+    setKillStopped(true, source);
+  }
+  else if (command == "RUN" || command == "START" || command == "GO" ||
+           command == "CONTINUE" || command == "RESUME" || command == "1")
+  {
+    setKillStopped(false, source);
+  }
+  else if (command == "TOGGLE")
+  {
+    setKillStopped(!killStopped, source);
+  }
+}
+
+void onMessengerMessage(const MessageMetadata &metadata, const uint8_t *payload, size_t length)
+{
+  char message[MiniMessenger::kMaxPayloadSize + 1];
+  const size_t copyLength = length < MiniMessenger::kMaxPayloadSize ? length : MiniMessenger::kMaxPayloadSize;
+  memcpy(message, payload, copyLength);
+  message[copyLength] = '\0';
+
+  Serial.print("MSG | from ");
+  Serial.print(metadata.fromBoardId);
+  Serial.print(": ");
+  Serial.println(message);
+
+  if (strstr(message, "type=heartbeat enable=1"))
+  {
+    setKillStopped(false, "heartbeat");
+    return;
+  }
+
+  if (strstr(message, "type=heartbeat enable=0"))
+  {
+    setKillStopped(true, "heartbeat");
+    return;
+  }
+
+  if (strstr(message, "type=emergency enabled=true") ||
+      strstr(message, "type=disable enabled=false"))
+  {
+    setKillStopped(true, "server");
+    return;
+  }
+
+  handleTextCommand(String(message), "message");
+}
+
+void sendRegistration()
+{
+  if (!USE_WIFI_KILL || !messenger.isConnected())
+  {
+    return;
+  }
+
+  char registration[80];
+  snprintf(registration,
+           sizeof(registration),
+           "type=register team_id=%s board_id=%s",
+           GROUP_ID,
+           BOARD_ID);
+
+  if (messenger.sendToBoard("server", registration))
+  {
+    Serial.println("MSG | Registered with server.");
+  }
+}
+
+void updateWiFiKillSwitch()
+{
+  if (!USE_WIFI_KILL)
+  {
+    return;
+  }
+
+  messenger.loop();
+
+  if (messenger.isConnected() &&
+      (lastRegisterMs == 0 || millis() - lastRegisterMs >= REGISTER_INTERVAL_MS))
+  {
+    lastRegisterMs = millis();
+    sendRegistration();
+  }
+}
+
+void driveBySide(int16_t leftSpeed, int16_t rightSpeed)
+{
+  setMotorSpeeds(
+      rightSpeed * FWD_RF,
+      rightSpeed * FWD_RR,
+      leftSpeed * FWD_LR,
+      leftSpeed * FWD_LF);
+}
+
+void driveForward(int16_t speed)
+{
+  driveBySide(speed, speed);
+}
+
+void driveForwardWithCenterTrim()
+{
+  int shoulderDelta = (int)sensorValues[3] - (int)sensorValues[1]; // SL - SR
+
+  if (shoulderDelta > CENTER_TRIM_THRESHOLD)
+  {
+    // Line is slightly left of center: arc left while still moving forward.
+    driveBySide(CENTER_FORWARD_SPEED - CENTER_TRIM_SPEED,
+                CENTER_FORWARD_SPEED + CENTER_TRIM_SPEED);
+    return;
+  }
+
+  if (shoulderDelta < -CENTER_TRIM_THRESHOLD)
+  {
+    // Line is slightly right of center: arc right while still moving forward.
+    driveBySide(CENTER_FORWARD_SPEED + CENTER_TRIM_SPEED,
+                CENTER_FORWARD_SPEED - CENTER_TRIM_SPEED);
+    return;
+  }
+
+  driveForward(CENTER_FORWARD_SPEED);
+}
+
+void pivotRight(int16_t speed)
+{
+  // Right side backward, left side forward.
+  driveBySide(speed, -speed);
+}
+
+void pivotLeft(int16_t speed)
+{
+  // Left side backward, right side forward.
+  driveBySide(-speed, speed);
+}
+
+void scanI2CBus(TwoWire &bus, const char *name)
+{
+  Serial.print("Scanning ");
+  Serial.print(name);
+  Serial.println("...");
+
+  for (uint8_t address = 1; address < 127; address++)
+  {
+    bus.beginTransmission(address);
+    uint8_t error = bus.endTransmission();
+
+    if (error == 0)
+    {
+      Serial.print("  Found I2C device at 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+    }
+  }
+}
+
+bool initIMU()
+{
+  const bool ad0Values[] = {false, true};
+
+  for (uint8_t i = 0; i < 2; i++)
+  {
+    imuAd0Val = ad0Values[i];
+
+    Serial.print("IMU | Trying AD0=");
+    Serial.print(imuAd0Val ? 1 : 0);
+    Serial.print(" address 0x");
+    Serial.println(imuAd0Val ? "69" : "68");
+
+    imu.begin(Wire, imuAd0Val);
+    Serial.print("IMU | Status: ");
+    Serial.println(imu.statusString());
+
+    if (imu.status == ICM_20948_Stat_Ok)
+    {
+      Serial.print("IMU | Ready at 0x");
+      Serial.println(imuAd0Val ? "69" : "68");
+      return true;
+    }
+
+    delay(100);
+  }
+
+  return false;
+}
+
+void calibrateGyroZ()
+{
+  Serial.println("IMU | Calibrating gyro Z. Keep the car still...");
+
+  const int samples = 300;
+  const unsigned long timeoutMs = 6000;
+  float sum = 0.0;
+  int count = 0;
+  unsigned long startMs = millis();
+
+  while (count < samples && millis() - startMs < timeoutMs)
+  {
+    if (imu.dataReady())
+    {
+      imu.getAGMT();
+      sum += imu.gyrZ();
+      count++;
+    }
+    delay(5);
+  }
+
+  gyroZBias = count > 0 ? sum / count : 0.0;
+
+  Serial.print("IMU | Gyro Z bias = ");
+  Serial.print(gyroZBias, 6);
+  Serial.print(" from ");
+  Serial.print(count);
+  Serial.println(" samples");
+}
+
+void updateYaw()
+{
+  if (!imu.dataReady())
+  {
+    return;
+  }
+
+  imu.getAGMT();
+
+  unsigned long nowMicros = micros();
+  if (lastUpdateMicros == 0)
+  {
+    lastUpdateMicros = nowMicros;
+    return;
+  }
+
+  float dt = (nowMicros - lastUpdateMicros) / 1000000.0;
+  lastUpdateMicros = nowMicros;
+
+  if (dt <= 0.0 || dt > 0.25)
+  {
+    return;
+  }
+
+  yawDeg += (imu.gyrZ() - gyroZBias) * dt;
+}
+
+float rightAngleTurnDeg()
+{
+  return fabs(yawDeg - turnStartYawDeg);
+}
+
+unsigned int readReflectancePin(uint8_t pin)
+{
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(10);
+
+  pinMode(pin, INPUT);
+
+  unsigned long start = micros();
+  while (digitalRead(pin) == HIGH)
+  {
+    if (micros() - start >= SENSOR_TIMEOUT_US)
+    {
+      return SENSOR_TIMEOUT_US;
+    }
+  }
+
+  return (unsigned int)(micros() - start);
+}
+
+void readSensors()
+{
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    sensorValues[i] = readReflectancePin(SENSOR_PINS[i]);
+    bool highMeansLine = sensorValues[i] >= LINE_THRESHOLD;
+    sensorOnLine[i] = BLACK_LINE_IS_HIGH ? highMeansLine : !highMeansLine;
+  }
+}
+
+bool anySensorOnLine()
+{
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    if (sensorOnLine[i])
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool centerOrAnySensorOnLine()
+{
+  readSensors();
+  printSensors("FIND_LINE");
+  return anySensorOnLine();
+}
+
+bool sensorAboveCorrectionThreshold(uint8_t index)
+{
+  return sensorValues[index] >= LINE_THRESHOLD;
+}
+
+bool leftCorrectionRequested()
+{
+  return sensorAboveCorrectionThreshold(3) || sensorAboveCorrectionThreshold(4);
+}
+
+bool rightCorrectionRequested()
+{
+  return sensorAboveCorrectionThreshold(0) || sensorAboveCorrectionThreshold(1);
+}
+
+bool sensorAboveStrongCorrectionThreshold(uint8_t index)
+{
+  return sensorValues[index] >= STRONG_SIDE_CORRECTION_THRESHOLD;
+}
+
+bool leftStrongCorrectionRequested()
+{
+  return sensorAboveStrongCorrectionThreshold(3) || sensorAboveStrongCorrectionThreshold(4);
+}
+
+bool rightStrongCorrectionRequested()
+{
+  return sensorAboveStrongCorrectionThreshold(0) || sensorAboveStrongCorrectionThreshold(1);
+}
+
+bool centerLineDetected()
+{
+  // Real center samples often read as SR + SL on the line while M is below
+  // threshold, so do not rely on M alone.
+  bool middle = sensorOnLine[2];
+  bool balancedShoulders = sensorOnLine[1] && sensorOnLine[3] &&
+                           !sensorOnLine[0] && !sensorOnLine[4];
+  return middle || balancedShoulders;
+}
+
+bool centerLineStable()
+{
+  bool outerStrong = sensorAboveStrongCorrectionThreshold(0) ||
+                     sensorAboveStrongCorrectionThreshold(4);
+  return centerLineDetected() && !outerStrong;
+}
+
+int sideSignalScore(uint8_t outerIndex, uint8_t slightIndex)
+{
+  int score = 0;
+
+  if (sensorValues[outerIndex] > LINE_THRESHOLD)
+  {
+    score += sensorValues[outerIndex] - LINE_THRESHOLD;
+  }
+
+  if (sensorValues[slightIndex] > LINE_THRESHOLD)
+  {
+    score += sensorValues[slightIndex] - LINE_THRESHOLD;
+  }
+
+  return score;
+}
+
+int dominantCorrectionDirection()
+{
+  int rightScore = sideSignalScore(0, 1);
+  int leftScore = sideSignalScore(4, 3);
+
+  if (rightScore > leftScore + SIDE_DOMINANCE_MARGIN)
+  {
+    return 1;
+  }
+
+  if (leftScore > rightScore + SIDE_DOMINANCE_MARGIN)
+  {
+    return -1;
+  }
+
+  return 0;
+}
+
+bool leftRightAngleRequested()
+{
+  return sensorValues[4] >= STRONG_SIDE_CORRECTION_THRESHOLD &&
+         sensorOnLine[3] &&
+         !centerLineStable();
+}
+
+bool rightRightAngleRequested()
+{
+  return sensorValues[0] >= STRONG_SIDE_CORRECTION_THRESHOLD &&
+         sensorOnLine[1] &&
+         !centerLineStable();
+}
+
+uint8_t sensorsOnLineCount()
+{
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    if (sensorOnLine[i])
+    {
+      count++;
+    }
+  }
+  return count;
+}
+
+bool intersectionRequested()
+{
+  bool bothOuterStrong = sensorValues[0] >= STRONG_SIDE_CORRECTION_THRESHOLD &&
+                         sensorValues[4] >= STRONG_SIDE_CORRECTION_THRESHOLD;
+  return bothOuterStrong || sensorsOnLineCount() >= 4;
+}
+
+void prepareCorrection(int direction, bool strongCorrection)
+{
+  correctionDirection = direction;
+  activeCorrectionPulseMs = strongCorrection ? STRONG_CORRECTION_PULSE_MS : CORRECTION_PULSE_MS;
+  enterState(PRE_CORRECT_STOP);
+}
+
+void prepareRightAngleTurn(int direction)
+{
+  pendingTurnDirection = direction;
+  enterState(direction < 0 ? PRE_TURN_FORWARD_LEFT : PRE_TURN_FORWARD_RIGHT);
+}
+
+void printSensors(const char *label)
+{
+  if (millis() - lastPrintMs < DEBUG_PRINT_INTERVAL_MS)
+  {
+    return;
+  }
+
+  Serial.print(label);
+  Serial.print(" [R,SR,M,SL,L]: ");
+
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    Serial.print(sensorValues[i]);
+    Serial.print(sensorOnLine[i] ? "*" : " ");
+    Serial.print(" ");
+  }
+
+  Serial.print("| lastDir=");
+  Serial.print(lastDirection);
+  Serial.print(" corrDir=");
+  Serial.print(correctionDirection);
+  Serial.print(" rScore=");
+  Serial.print(sideSignalScore(0, 1));
+  Serial.print(" lScore=");
+  Serial.print(sideSignalScore(4, 3));
+  Serial.print(" routeTurn=");
+  Serial.print(completedRouteTurns);
+  Serial.print(" yaw=");
+  Serial.print(yawDeg, 1);
+  Serial.print(" kill=");
+  Serial.println(killStopped ? "STOP" : "RUN");
+
+  lastPrintMs = millis();
+}
+
+float readUltrasonicCm(UltrasonicSensor &sensor)
+{
+  digitalWrite(sensor.trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(sensor.trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(sensor.trigPin, LOW);
+
+  unsigned long duration = pulseIn(sensor.echoPin, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (duration == 0)
+  {
+    return -1.0;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+void updateUltrasonic()
+{
+  if (millis() - lastUltrasonicReadMs < ULTRASONIC_SENSOR_GAP_MS)
+  {
+    return;
+  }
+
+  lastUltrasonicReadMs = millis();
+  ultrasonicSensors[nextUltrasonicIndex].distanceCm = readUltrasonicCm(ultrasonicSensors[nextUltrasonicIndex]);
+  nextUltrasonicIndex = (nextUltrasonicIndex + 1) % NUM_ULTRASONIC;
+}
+
+void printDistanceTo(Print &out, float distanceCm)
+{
+  if (distanceCm < 0.0)
+  {
+    out.print("NA");
+  }
+  else
+  {
+    out.print(distanceCm, 1);
+  }
+}
+
+void printDistance(float distanceCm)
+{
+  printDistanceTo(Serial, distanceCm);
+}
+
+void printSensorStatus()
+{
+  if (millis() - lastSensorStatusMs < SENSOR_STATUS_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastSensorStatusMs = millis();
+
+  Serial.print("STATUS | IR R(D22)=");
+  Serial.print(sensorValues[0]);
+  Serial.print(sensorOnLine[0] ? "*" : " ");
+  Serial.print(" SR(D24)=");
+  Serial.print(sensorValues[1]);
+  Serial.print(sensorOnLine[1] ? "*" : " ");
+  Serial.print(" M(D26)=");
+  Serial.print(sensorValues[2]);
+  Serial.print(sensorOnLine[2] ? "*" : " ");
+  Serial.print(" SL(D28)=");
+  Serial.print(sensorValues[3]);
+  Serial.print(sensorOnLine[3] ? "*" : " ");
+  Serial.print(" L(D31)=");
+  Serial.print(sensorValues[4]);
+  Serial.print(sensorOnLine[4] ? "*" : " ");
+
+  Serial.print(" | US Front=");
+  printDistance(ultrasonicSensors[0].distanceCm);
+  Serial.print("cm Left=");
+  printDistance(ultrasonicSensors[1].distanceCm);
+  Serial.print("cm Right=");
+  printDistance(ultrasonicSensors[2].distanceCm);
+  Serial.print("cm | Yaw=");
+  Serial.print(yawDeg, 1);
+  Serial.print(" | State=");
+  Serial.print(stateName(state));
+  Serial.print(" | Motor RF=");
+  Serial.print(currentMotorRf);
+  Serial.print(" RR=");
+  Serial.print(currentMotorRr);
+  Serial.print(" LR=");
+  Serial.print(currentMotorLr);
+  Serial.print(" LF=");
+  Serial.print(currentMotorLf);
+  Serial.print(" | Kill=");
+  Serial.print(killStopped ? "STOP" : "RUN");
+  Serial.print(" | Obstacle=");
+  Serial.print(frontObstacleTooClose() ? "YES" : "NO");
+  Serial.print(" | Revive=");
+  Serial.print(isRevived ? "YES" : "NO");
+  Serial.print(" | Blink=");
+  Serial.print(redBlinkEnabled ? "YES" : "NO");
+  Serial.print(" | MQTT=");
+  Serial.print(USE_WIFI_KILL ? (messenger.isConnected() ? "OK" : "NO") : "OFF");
+  Serial.print(" | RFID=");
+  Serial.println(USE_RFID ? (rfidReady ? "READY" : "NO") : "OFF");
+}
+
+bool initRFIDNoResetPin()
+{
+  Wire1.beginTransmission(RFID_I2C_ADDR);
+  if (Wire1.endTransmission() != 0)
+  {
+    Serial.println("RFID | Not found at I2C address 0x28.");
+    return false;
+  }
+
+  mfrc522.PCD_Reset();
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TModeReg, 0x80);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TPrescalerReg, 0xA9);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegH, 0x03);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegL, 0xE8);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TxASKReg, 0x40);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::ModeReg, 0x3D);
+  mfrc522.PCD_AntennaOn();
+
+  byte version = mfrc522.PCD_ReadRegister(MFRC522_I2C::VersionReg);
+  Serial.print("RFID | Ready at 0x28, version register=0x");
+  if (version < 0x10)
+  {
+    Serial.print("0");
+  }
+  Serial.println(version, HEX);
+
+  if (version == 0x00 || version == 0xFF)
+  {
+    Serial.println("RFID | Version read failed. Check SDA1/SCL1, VCC, GND, and I2C address.");
+    return false;
+  }
+
+  return true;
+}
+
+void updateRFID()
+{
+  if (!USE_RFID)
+  {
+    return;
+  }
+
+  if (!rfidReady)
+  {
+    if (millis() - lastRFIDRetryMs >= RFID_RETRY_INTERVAL_MS)
+    {
+      lastRFIDRetryMs = millis();
+      rfidReady = initRFIDNoResetPin();
+    }
+    return;
+  }
+
+  if (millis() - lastRFIDCheckMs < RFID_CHECK_INTERVAL_MS)
+  {
+    return;
+  }
+  lastRFIDCheckMs = millis();
+
+  if (!mfrc522.PICC_IsNewCardPresent())
+  {
+    return;
+  }
+
+  if (!mfrc522.PICC_ReadCardSerial())
+  {
+    return;
+  }
+
+  Serial.print("RFID | Card ID:");
+  for (byte i = 0; i < mfrc522.uid.size; i++)
+  {
+    Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(mfrc522.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  mfrc522.PICC_HaltA();
+}
+
+bool frontObstacleTooClose()
+{
+  float frontCm = ultrasonicSensors[0].distanceCm;
+  return frontCm > 0.0 && frontCm < FRONT_OBSTACLE_STOP_CM;
+}
+
+bool obstacleAvoidanceTurnActive()
+{
+  return state == TURN_LEFT_90 ||
+         state == TURN_RIGHT_90 ||
+         state == AFTER_TURN_SETTLE ||
+         state == FIND_LINE_SMALL_LEFT ||
+         state == FIND_LINE_SMALL_RIGHT ||
+         state == FIND_LINE_BIG_LEFT ||
+         state == FIND_LINE_BIG_RIGHT ||
+         state == RECOVERY_FORWARD ||
+         state == RECOVERY_STOP ||
+         state == RECOVERY_SWING_LEFT ||
+         state == RECOVERY_SWING_RIGHT;
+}
+
+bool sideIsClear(float distanceCm)
+{
+  return distanceCm < 0.0 || distanceCm >= SIDE_OBSTACLE_CLEAR_CM;
+}
+
+bool handleFrontObstacleAvoidance()
+{
+  if (obstacleAvoidanceTurnActive())
+  {
+    return false;
+  }
+
+  ultrasonicSensors[0].distanceCm = readUltrasonicCm(ultrasonicSensors[0]);
+  if (!frontObstacleTooClose())
+  {
+    return false;
+  }
+
+  stopAllMotors();
+  ultrasonicSensors[1].distanceCm = readUltrasonicCm(ultrasonicSensors[1]);
+  ultrasonicSensors[2].distanceCm = readUltrasonicCm(ultrasonicSensors[2]);
+
+  bool leftClear = sideIsClear(ultrasonicSensors[1].distanceCm);
+  bool rightClear = sideIsClear(ultrasonicSensors[2].distanceCm);
+
+  Serial.print("OBSTACLE | Front=");
+  printDistance(ultrasonicSensors[0].distanceCm);
+  Serial.print("cm Left=");
+  printDistance(ultrasonicSensors[1].distanceCm);
+  Serial.print("cm Right=");
+  printDistance(ultrasonicSensors[2].distanceCm);
+
+  if (leftClear)
+  {
+    obstacleStopped = false;
+    obstacleAvoidanceTurning = true;
+    lastTurnDirection = -1;
+    Serial.println("cm -> TURN_LEFT_90");
+    enterState(TURN_LEFT_90);
+    return true;
+  }
+
+  if (rightClear)
+  {
+    obstacleStopped = false;
+    obstacleAvoidanceTurning = true;
+    lastTurnDirection = 1;
+    Serial.println("cm -> TURN_RIGHT_90");
+    enterState(TURN_RIGHT_90);
+    return true;
+  }
+
+  setObstacleStopped(true);
+  Serial.println("cm -> BOTH SIDES BLOCKED");
+  return true;
+}
+
+void setObstacleStopped(bool stopped)
+{
+  if (stopped == obstacleStopped)
+  {
+    if (stopped)
+    {
+      stopAllMotors();
+      if (millis() - lastObstaclePrintMs >= 500)
+      {
+        lastObstaclePrintMs = millis();
+        Serial.print("OBSTACLE | Front=");
+        printDistance(ultrasonicSensors[0].distanceCm);
+        Serial.println("cm -> STOP");
+      }
+    }
+    return;
+  }
+
+  obstacleStopped = stopped;
+
+  Serial.print("OBSTACLE | Front=");
+  printDistance(ultrasonicSensors[0].distanceCm);
+  Serial.println(stopped ? "cm -> STOP" : "cm -> CLEAR");
+
+  if (stopped)
+  {
+    obstaclePauseStartMs = millis();
+    stopAllMotors();
+  }
+  else if (obstaclePauseStartMs != 0)
+  {
+    stateStartMs += millis() - obstaclePauseStartMs;
+    obstaclePauseStartMs = 0;
+    lastUpdateMicros = micros();
+  }
+}
+
+void prepareReflectanceRecovery(const char *reason)
+{
+  Serial.print("RECOVERY | ");
+  Serial.print(reason);
+  Serial.println(" -> forward, stop, swing to reacquire line");
+  enterState(RECOVERY_FORWARD);
+}
+
+void enterState(RobotState nextState)
+{
+  state = nextState;
+  stateStartMs = millis();
+
+  switch (state)
+  {
+    case SENSE_LINE:
+      break;
+
+    case FORWARD_PULSE:
+      Serial.println("State: FORWARD_PULSE");
+      break;
+
+    case SENSOR_SETTLE:
+      stopAllMotors();
+      break;
+
+    case PRE_CORRECT_STOP:
+      Serial.println("State: PRE_CORRECT_STOP");
+      stopAllMotors();
+      break;
+
+    case CORRECT_LEFT:
+      Serial.println("State: CORRECT_LEFT");
+      break;
+
+    case CORRECT_RIGHT:
+      Serial.println("State: CORRECT_RIGHT");
+      break;
+
+    case AFTER_CORRECT_SETTLE:
+      stopAllMotors();
+      break;
+
+    case PRE_TURN_FORWARD_LEFT:
+      Serial.println("State: PRE_TURN_FORWARD_LEFT");
+      Serial.print("PRE_TURN | target cm=");
+      Serial.print(PRE_TURN_FORWARD_CM, 1);
+      Serial.print(" ms=");
+      Serial.println(PRE_TURN_FORWARD_MS);
+      break;
+
+    case PRE_TURN_FORWARD_RIGHT:
+      Serial.println("State: PRE_TURN_FORWARD_RIGHT");
+      Serial.print("PRE_TURN | target cm=");
+      Serial.print(PRE_TURN_FORWARD_CM, 1);
+      Serial.print(" ms=");
+      Serial.println(PRE_TURN_FORWARD_MS);
+      break;
+
+    case TURN_LEFT_90:
+      turnStartYawDeg = yawDeg;
+      lastTurnDirection = -1;
+      Serial.println("State: TURN_LEFT_90");
+      break;
+
+    case TURN_RIGHT_90:
+      turnStartYawDeg = yawDeg;
+      lastTurnDirection = 1;
+      Serial.println("State: TURN_RIGHT_90");
+      break;
+
+    case AFTER_TURN_SETTLE:
+      stopAllMotors();
+      break;
+
+    case FIND_LINE_SMALL_LEFT:
+      Serial.println("State: FIND_LINE_SMALL_LEFT");
+      break;
+
+    case FIND_LINE_SMALL_RIGHT:
+      Serial.println("State: FIND_LINE_SMALL_RIGHT");
+      break;
+
+    case FIND_LINE_BIG_LEFT:
+      Serial.println("State: FIND_LINE_BIG_LEFT");
+      break;
+
+    case FIND_LINE_BIG_RIGHT:
+      Serial.println("State: FIND_LINE_BIG_RIGHT");
+      break;
+
+    case RECOVERY_FORWARD:
+      Serial.println("State: RECOVERY_FORWARD");
+      break;
+
+    case RECOVERY_STOP:
+      Serial.println("State: RECOVERY_STOP");
+      stopAllMotors();
+      break;
+
+    case RECOVERY_SWING_LEFT:
+      Serial.println("State: RECOVERY_SWING_LEFT");
+      break;
+
+    case RECOVERY_SWING_RIGHT:
+      Serial.println("State: RECOVERY_SWING_RIGHT");
+      break;
+
+    case LINE_LOST_STOP:
+      Serial.println("State: LINE_LOST_STOP");
+      stopAllMotors();
+      break;
+  }
+}
+
+void senseLineStep()
+{
+  readSensors();
+  printSensors(SENSOR_DEBUG_MODE ? "QTR_DEBUG" : "SENSE");
+
+  if (SENSOR_DEBUG_MODE)
+  {
+    stopAllMotors();
+    return;
+  }
+
+  // Sensor order: [0] right, [1] slight right, [2] middle,
+  // [3] slight left, [4] left.
+  if (sensorOnLine[2])
+  {
+    lastDirection = 0;
+    correctionDirection = 0;
+    activeCorrectionPulseMs = CORRECTION_PULSE_MS;
+    driveForwardWithCenterTrim();
+    return;
+  }
+
+  bool rawIntersection = intersectionRequested();
+
+  if (ENABLE_ROUTE_TURNS)
+  {
+    bool allowRightAngle = millis() >= ignoreRightAngleUntilMs;
+    bool leftAngle = allowRightAngle && leftRightAngleRequested();
+    bool rightAngle = allowRightAngle && rightRightAngleRequested();
+    bool intersection = allowRightAngle && rawIntersection;
+
+    if (completedRouteTurns == 0 && leftAngle)
+    {
+      lastDirection = -1;
+      prepareRightAngleTurn(-1);
+      return;
+    }
+
+    if (completedRouteTurns == 1 && (intersection || rightAngle))
+    {
+      lastDirection = 1;
+      prepareRightAngleTurn(1);
+      return;
+    }
+  }
+  else if (rawIntersection)
+  {
+    prepareReflectanceRecovery("intersection/crossroad");
+    return;
+  }
+
+  if (centerLineStable())
+  {
+    lastDirection = 0;
+    correctionDirection = 0;
+    activeCorrectionPulseMs = CORRECTION_PULSE_MS;
+    enterState(FORWARD_PULSE);
+    return;
+  }
+
+  bool leftNeedsCorrection = leftCorrectionRequested();
+  bool rightNeedsCorrection = rightCorrectionRequested();
+  int dominantDirection = dominantCorrectionDirection();
+
+  if (leftNeedsCorrection && rightNeedsCorrection && dominantDirection == 0)
+  {
+    prepareReflectanceRecovery("ambiguous reflectance");
+    return;
+  }
+
+  if (leftNeedsCorrection && rightNeedsCorrection && dominantDirection != 0)
+  {
+    lastDirection = dominantDirection;
+
+    if (ENABLE_LINE_CORRECTION)
+    {
+      prepareCorrection(dominantDirection,
+                        dominantDirection < 0 ? leftStrongCorrectionRequested() : rightStrongCorrectionRequested());
+    }
+    else
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  if (leftNeedsCorrection && !rightNeedsCorrection)
+  {
+    lastDirection = -1;
+
+    if (ENABLE_LINE_CORRECTION)
+    {
+      prepareCorrection(-1, leftStrongCorrectionRequested());
+    }
+    else
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  if (rightNeedsCorrection && !leftNeedsCorrection)
+  {
+    lastDirection = 1;
+
+    if (ENABLE_LINE_CORRECTION)
+    {
+      prepareCorrection(1, rightStrongCorrectionRequested());
+    }
+    else
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  if (sensorOnLine[3] || sensorOnLine[4])
+  {
+    lastDirection = -1;
+
+    if (ENABLE_LINE_CORRECTION)
+    {
+      prepareCorrection(-1, leftStrongCorrectionRequested());
+    }
+    else
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  if (sensorOnLine[1] || sensorOnLine[0])
+  {
+    lastDirection = 1;
+
+    if (ENABLE_LINE_CORRECTION)
+    {
+      prepareCorrection(1, rightStrongCorrectionRequested());
+    }
+    else
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  if (!anySensorOnLine())
+  {
+    prepareReflectanceRecovery("line temporarily lost");
+    return;
+  }
+
+  stopAllMotors();
+}
+
+void correctionStep()
+{
+  readSensors();
+  printSensors(correctionDirection < 0 ? "CORRECT_LEFT" : "CORRECT_RIGHT");
+
+  if (sensorOnLine[2])
+  {
+    lastDirection = 0;
+    correctionDirection = 0;
+    activeCorrectionPulseMs = CORRECTION_PULSE_MS;
+    driveForwardWithCenterTrim();
+    enterState(SENSE_LINE);
+    return;
+  }
+
+  if (centerLineStable())
+  {
+    lastDirection = 0;
+    correctionDirection = 0;
+    activeCorrectionPulseMs = CORRECTION_PULSE_MS;
+    stopAllMotors();
+    enterState(AFTER_CORRECT_SETTLE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= activeCorrectionPulseMs)
+  {
+    stopAllMotors();
+    enterState(AFTER_CORRECT_SETTLE);
+    return;
+  }
+
+  if (correctionDirection < 0)
+  {
+    pivotLeft(max(PIVOT_SPEED, MIN_CORRECTION_SPEED));
+  }
+  else if (correctionDirection > 0)
+  {
+    pivotRight(max(PIVOT_SPEED, MIN_CORRECTION_SPEED));
+  }
+  else
+  {
+    stopAllMotors();
+  }
+}
+
+void printTurnStatus(const char *label)
+{
+  if (millis() - lastPrintMs < DEBUG_PRINT_INTERVAL_MS)
+  {
+    return;
+  }
+
+  float turnedDeg = rightAngleTurnDeg();
+  float targetDeg = obstacleAvoidanceTurning ? OBSTACLE_RIGHT_ANGLE_TARGET_DEG : RIGHT_ANGLE_TARGET_DEG;
+  uint16_t timeoutMs = obstacleAvoidanceTurning ? OBSTACLE_RIGHT_ANGLE_TIMEOUT_MS : RIGHT_ANGLE_TIMEOUT_MS;
+  int16_t speed = turnedDeg >= RIGHT_ANGLE_SLOW_DOWN_DEG ? RIGHT_ANGLE_SLOW_SPEED : RIGHT_ANGLE_FAST_SPEED;
+
+  lastPrintMs = millis();
+  Serial.print("TURN | ");
+  Serial.print(label);
+  Serial.print(" yaw=");
+  Serial.print(yawDeg, 1);
+  Serial.print(" delta=");
+  Serial.print(turnedDeg, 1);
+  Serial.print("/");
+  Serial.print(targetDeg, 1);
+  Serial.print(" speed=");
+  Serial.print(speed);
+  Serial.print(" elapsed=");
+  Serial.print(millis() - stateStartMs);
+  Serial.print("/");
+  Serial.println(timeoutMs);
+}
+
+void rightAngleTurnStep(bool turnLeft)
+{
+  printTurnStatus(turnLeft ? "LEFT_90" : "RIGHT_90");
+  float targetDeg = obstacleAvoidanceTurning ? OBSTACLE_RIGHT_ANGLE_TARGET_DEG : RIGHT_ANGLE_TARGET_DEG;
+  uint16_t timeoutMs = obstacleAvoidanceTurning ? OBSTACLE_RIGHT_ANGLE_TIMEOUT_MS : RIGHT_ANGLE_TIMEOUT_MS;
+
+  if (rightAngleTurnDeg() >= targetDeg)
+  {
+    stopAllMotors();
+    completedRouteTurns++;
+    pendingTurnDirection = 0;
+    if (obstacleAvoidanceTurning)
+    {
+      obstacleAvoidanceTurning = false;
+      ignoreRightAngleUntilMs = millis() + 600;
+      Serial.println("OBSTACLE | Turn complete -> resume line recovery");
+      enterState(RECOVERY_FORWARD);
+      return;
+    }
+    enterState(AFTER_TURN_SETTLE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= timeoutMs)
+  {
+    Serial.println("TURN | Timeout before IMU target.");
+    stopAllMotors();
+    completedRouteTurns++;
+    pendingTurnDirection = 0;
+    if (obstacleAvoidanceTurning)
+    {
+      obstacleAvoidanceTurning = false;
+      ignoreRightAngleUntilMs = millis() + 600;
+      Serial.println("OBSTACLE | Turn timeout -> resume line recovery");
+      enterState(RECOVERY_FORWARD);
+      return;
+    }
+    enterState(AFTER_TURN_SETTLE);
+    return;
+  }
+
+  int16_t speed = rightAngleTurnDeg() >= RIGHT_ANGLE_SLOW_DOWN_DEG ? RIGHT_ANGLE_SLOW_SPEED : RIGHT_ANGLE_FAST_SPEED;
+
+  if (turnLeft)
+  {
+    pivotLeft(speed);
+  }
+  else
+  {
+    pivotRight(speed);
+  }
+}
+
+void enterFirstFindLineState()
+{
+  if (lastTurnDirection < 0)
+  {
+    findLineFirstDirection = -1;
+    enterState(FIND_LINE_SMALL_LEFT);
+  }
+  else
+  {
+    findLineFirstDirection = 1;
+    enterState(FIND_LINE_SMALL_RIGHT);
+  }
+}
+
+bool isFirstFindLineDirection(bool turnLeft)
+{
+  return (turnLeft && findLineFirstDirection < 0) ||
+         (!turnLeft && findLineFirstDirection > 0);
+}
+
+uint16_t findLineSmallDuration(bool turnLeft)
+{
+  return isFirstFindLineDirection(turnLeft) ? FIND_LINE_SMALL_MS : FIND_LINE_SMALL_MS * 2;
+}
+
+uint16_t findLineBigDuration(bool turnLeft)
+{
+  return isFirstFindLineDirection(turnLeft) ? FIND_LINE_BIG_MS : FIND_LINE_BIG_MS * 2;
+}
+
+RobotState nextSmallFindLineState(bool turnLeft)
+{
+  if (isFirstFindLineDirection(turnLeft))
+  {
+    return turnLeft ? FIND_LINE_SMALL_RIGHT : FIND_LINE_SMALL_LEFT;
+  }
+
+  return findLineFirstDirection < 0 ? FIND_LINE_BIG_LEFT : FIND_LINE_BIG_RIGHT;
+}
+
+RobotState nextBigFindLineState(bool turnLeft)
+{
+  if (isFirstFindLineDirection(turnLeft))
+  {
+    return turnLeft ? FIND_LINE_BIG_RIGHT : FIND_LINE_BIG_LEFT;
+  }
+
+  return LINE_LOST_STOP;
+}
+
+void findLineStep(bool turnLeft, uint16_t durationMs, RobotState nextState)
+{
+  if (centerOrAnySensorOnLine())
+  {
+    stopAllMotors();
+    ignoreRightAngleUntilMs = millis() + 600;
+    enterState(SENSE_LINE);
+    return;
+  }
+
+  if (millis() - stateStartMs >= durationMs)
+  {
+    stopAllMotors();
+    enterState(nextState);
+    return;
+  }
+
+  if (turnLeft)
+  {
+    pivotLeft(FIND_LINE_SPEED);
+  }
+  else
+  {
+    pivotRight(FIND_LINE_SPEED);
+  }
+}
+
+void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0)
+{
+  mc.setBus(&Wire1);
+  mc.reinitialize();
+  mc.disableCrc();
+  mc.clearResetFlag();
+
+  mc.setMaxAcceleration(m1, 1400);
+  mc.setMaxDeceleration(m1, 1600);
+
+  if (m2 != 0)
+  {
+    mc.setMaxAcceleration(m2, 1400);
+    mc.setMaxDeceleration(m2, 1600);
+  }
+
+  if (m3 != 0)
+  {
+    mc.setMaxAcceleration(m3, 1400);
+    mc.setMaxDeceleration(m3, 1600);
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  beginButton(reviveButton);
+  beginButton(killButton);
+
+  for (uint8_t i = 0; i < NUM_ULTRASONIC; i++)
+  {
+    pinMode(ultrasonicSensors[i].trigPin, OUTPUT);
+    pinMode(ultrasonicSensors[i].echoPin, INPUT);
+    digitalWrite(ultrasonicSensors[i].trigPin, LOW);
+  }
+
+  Wire.begin();
+  Wire.setClock(400000);
+  scanI2CBus(Wire, "Wire IMU bus");
+
+  while (!initIMU())
+  {
+    Serial.println("IMU | Not ready, retrying...");
+    delay(500);
+  }
+
+  Wire1.begin();
+  Wire1.setClock(400000);
+  scanI2CBus(Wire1, "Wire1 for Motorons");
+
+  setupMotoron(mcLower, RF, RR, LR);
+  setupMotoron(mcUpper, LF);
+
+  stopAllMotors();
+
+  if (USE_RFID)
+  {
+    rfidReady = initRFIDNoResetPin();
+  }
+
+  Serial.println("IMU | Keep car still for gyro calibration.");
+  delay(1000);
+  calibrateGyroZ();
+  yawDeg = 0.0;
+  turnStartYawDeg = 0.0;
+  lastUpdateMicros = micros();
+
+  if (USE_WIFI_KILL)
+  {
+    messenger.onMessage(onMessengerMessage);
+    messenger.begin(WIFI_SSID, WIFI_PASSWORD, BROKER_HOST, BROKER_PORT, GROUP_ID, BOARD_ID);
+
+    Serial.print("MSG | Board ID: ");
+    Serial.println(BOARD_ID);
+    Serial.print("MSG | Group ID: ");
+    Serial.println(GROUP_ID);
+    Serial.println(REQUIRE_DASHBOARD_ENABLE ? "KILL | Waiting for dashboard enable heartbeat." : "KILL | Dashboard can stop/start movement.");
+  }
+
+  Serial.println("Line follower ready. Lower=0x10, Upper=0x11, direct line-follow mode.");
+  Serial.println(ENABLE_ROUTE_TURNS ? "ROUTE | Right-angle route turns enabled." : "ROUTE | Right-angle route turns disabled; direct line following only.");
+  Serial.println(USE_WIFI_KILL ? "MiniMessenger kill switch enabled." : "MiniMessenger kill switch disabled.");
+  Serial.println(USE_RFID ? "RFID | Enabled on SDA1/SCL1, address 0x28." : "RFID | Disabled.");
+  Serial.println("MECH | D45 toggles movement stop/run. D32 controls LED green only. Red=D36, Green=D38.");
+  Serial.print("OBSTACLE | Front <");
+  Serial.print(FRONT_OBSTACLE_STOP_CM, 1);
+  Serial.println("cm stops, checks left/right, then turns 90deg toward a clear side.");
+  Serial.println("OBSTACLE | After avoidance turn, robot enters recovery loop and resumes line following.");
+  Serial.println("RECOVERY | Crossroads/brief reflectance anomalies use forward-stop-swing line reacquire loop.");
+  Serial.println("STATUS | Trial1 sensor monitor enabled: reflectance, ultrasonic, yaw, state, MQTT kill, RFID.");
+  Serial.println("CONSOLE | Serial commands ready. Type HELP, STATUS, PARAMS, GET, SET, STOP, RUN.");
+  delay(1000);
+
+  if (killButton.stableState == LOW)
+  {
+    setKillStopped(true, "Mechanical boot D45");
+  }
+
+  enterState(SENSE_LINE);
+}
+
+void loop()
+{
+  updateButtons();
+  updateLed();
+  updateSerialConsole();
+  updateYaw();
+  updateWiFiKillSwitch();
+  updateRFID();
+  updateUltrasonic();
+
+  if (handleFrontObstacleAvoidance())
+  {
+    readSensors();
+    printSensors("OBSTACLE_AVOID");
+    printSensorStatus();
+    delay(5);
+    return;
+  }
+
+  if (obstacleStopped)
+  {
+    setObstacleStopped(false);
+  }
+
+  if (killStopped)
+  {
+    readSensors();
+    printSensors("KILL_HOLD");
+    printSensorStatus();
+    stopAllMotors();
+    delay(5);
+    return;
+  }
+
+  switch (state)
+  {
+    case SENSE_LINE:
+      senseLineStep();
+      break;
+
+    case FORWARD_PULSE:
+      driveForward(FORWARD_SPEED);
+      if (millis() - stateStartMs >= FORWARD_PULSE_MS)
+      {
+        stopAllMotors();
+        enterState(SENSOR_SETTLE);
+      }
+      break;
+
+    case SENSOR_SETTLE:
+      stopAllMotors();
+      if (millis() - stateStartMs >= SENSOR_SETTLE_MS)
+      {
+        enterState(SENSE_LINE);
+      }
+      break;
+
+    case PRE_CORRECT_STOP:
+      stopAllMotors();
+      if (millis() - stateStartMs >= PRE_CORRECT_STOP_MS)
+      {
+        if (correctionDirection < 0)
+        {
+          enterState(CORRECT_LEFT);
+        }
+        else if (correctionDirection > 0)
+        {
+          enterState(CORRECT_RIGHT);
+        }
+        else
+        {
+          enterState(SENSE_LINE);
+        }
+      }
+      break;
+
+    case CORRECT_LEFT:
+    case CORRECT_RIGHT:
+      correctionStep();
+      break;
+
+    case AFTER_CORRECT_SETTLE:
+      stopAllMotors();
+      if (millis() - stateStartMs >= AFTER_CORRECT_SETTLE_MS)
+      {
+        enterState(SENSE_LINE);
+      }
+      break;
+
+    case PRE_TURN_FORWARD_LEFT:
+      driveForward(FORWARD_SPEED);
+      if (millis() - stateStartMs >= PRE_TURN_FORWARD_MS)
+      {
+        stopAllMotors();
+        enterState(TURN_LEFT_90);
+      }
+      break;
+
+    case PRE_TURN_FORWARD_RIGHT:
+      driveForward(FORWARD_SPEED);
+      if (millis() - stateStartMs >= PRE_TURN_FORWARD_MS)
+      {
+        stopAllMotors();
+        enterState(TURN_RIGHT_90);
+      }
+      break;
+
+    case TURN_LEFT_90:
+      rightAngleTurnStep(true);
+      break;
+
+    case TURN_RIGHT_90:
+      rightAngleTurnStep(false);
+      break;
+
+    case AFTER_TURN_SETTLE:
+      stopAllMotors();
+      if (millis() - stateStartMs >= AFTER_TURN_SETTLE_MS)
+      {
+        enterFirstFindLineState();
+      }
+      break;
+
+    case FIND_LINE_SMALL_LEFT:
+      findLineStep(true, findLineSmallDuration(true), nextSmallFindLineState(true));
+      break;
+
+    case FIND_LINE_SMALL_RIGHT:
+      findLineStep(false, findLineSmallDuration(false), nextSmallFindLineState(false));
+      break;
+
+    case FIND_LINE_BIG_LEFT:
+      findLineStep(true, findLineBigDuration(true), nextBigFindLineState(true));
+      break;
+
+    case FIND_LINE_BIG_RIGHT:
+      findLineStep(false, findLineBigDuration(false), nextBigFindLineState(false));
+      break;
+
+    case RECOVERY_FORWARD:
+      driveForward(FORWARD_SPEED);
+      if (millis() - stateStartMs >= RECOVERY_FORWARD_MS)
+      {
+        stopAllMotors();
+        enterState(RECOVERY_STOP);
+      }
+      break;
+
+    case RECOVERY_STOP:
+      stopAllMotors();
+      if (millis() - stateStartMs >= RECOVERY_STOP_MS)
+      {
+        enterState(recoverySwingLeftFirst ? RECOVERY_SWING_LEFT : RECOVERY_SWING_RIGHT);
+      }
+      break;
+
+    case RECOVERY_SWING_LEFT:
+      readSensors();
+      printSensors("RECOVERY_LEFT");
+      if (anySensorOnLine())
+      {
+        stopAllMotors();
+        ignoreRightAngleUntilMs = millis() + 600;
+        enterState(SENSE_LINE);
+      }
+      else if (millis() - stateStartMs >= RECOVERY_SWING_MS)
+      {
+        stopAllMotors();
+        recoverySwingLeftFirst = false;
+        enterState(RECOVERY_SWING_RIGHT);
+      }
+      else
+      {
+        pivotLeft(FIND_LINE_SPEED);
+      }
+      break;
+
+    case RECOVERY_SWING_RIGHT:
+      readSensors();
+      printSensors("RECOVERY_RIGHT");
+      if (anySensorOnLine())
+      {
+        stopAllMotors();
+        ignoreRightAngleUntilMs = millis() + 600;
+        enterState(SENSE_LINE);
+      }
+      else if (millis() - stateStartMs >= RECOVERY_SWING_MS)
+      {
+        stopAllMotors();
+        recoverySwingLeftFirst = true;
+        enterState(RECOVERY_FORWARD);
+      }
+      else
+      {
+        pivotRight(FIND_LINE_SPEED);
+      }
+      break;
+
+    case LINE_LOST_STOP:
+      stopAllMotors();
+      break;
+  }
+
+  printSensorStatus();
+  delay(5);
+}
+
