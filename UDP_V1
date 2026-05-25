@@ -1,18 +1,4 @@
 /*
-------------bash------------
-/Users/admin/.platformio/penv/bin/platformio run --target upload
-/Users/admin/.platformio/penv/bin/platformio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
----------command------------
-HELP
-STATUS
-PARAMS
-GET line_threshold
-SET line_threshold 810
-SET forward_speed 850
-SET right_angle_target_deg 88
-STOP
-RUN
---------headfile------------
 [platformio]
 default_envs = giga_r1_m7
 
@@ -21,7 +7,6 @@ platform = ststm32
 board = giga_r1_m7
 framework = arduino
 upload_protocol = dfu
-board_upload.disable_flushing = true
 monitor_port = /dev/cu.usbmodem101
 monitor_speed = 115200
 
@@ -88,13 +73,23 @@ build_src_filter =
 
 lib_deps =
   kkloesener/MFRC522_I2C
----------main---------------
 */
 // VERSION: LINE_FOLLOWER_FIXED_LEFT_THEN_CROSS_RIGHT_REVERSED_FIND_V2
 // Loaded from saved_versions/line_follower_working_2026-05-19.cpp.
 // Current test changes: fixed route, first left 90, then right 90 at intersection.
 // Find-line swing order after turns is reversed from the previous test.
-
+/*
+STATUS
+PARAMS
+SET forward_speed 700
+SET obstacle_estop_cm 10
+FWD 2000 600
+LEFT90
+RIGHT90
+UTURN
+LINE ON
+STOP
+*/
 #include <Arduino.h>
 #include <math.h>
 #include <Wire.h>
@@ -2483,4 +2478,3 @@ void loop()
   printSensorStatus();
   delay(5);
 }
-
