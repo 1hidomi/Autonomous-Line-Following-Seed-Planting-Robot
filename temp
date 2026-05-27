@@ -8,13 +8,21 @@
 #include <math.h>
 #include <Wire.h>
 #include <Motoron.h>
+#include <MFRC522_I2C.h>
 #include "ICM_20948.h"
+
+const bool RFID_ONLY_TEST = true;
 
 const uint8_t LOWER_MOTORON_ADDR = 0x10;
 const uint8_t UPPER_MOTORON_ADDR = 0x11;
 
 MotoronI2C mcLower(LOWER_MOTORON_ADDR);
 MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
+
+// RFID WS1850S / MFRC522-compatible module on SDA1/SCL1.
+const uint8_t RFID_I2C_ADDR = 0x28;
+const uint8_t RFID_UNUSED_RESET_PIN = 0xFF;
+MFRC522_I2C mfrc522(RFID_I2C_ADDR, RFID_UNUSED_RESET_PIN, &Wire1);
 
 // ICM-20948 on SDA/SCL, D20/D21.
 ICM_20948_I2C imu;
@@ -75,6 +83,10 @@ const uint8_t US_RIGHT_TRIG = 33;
 const uint8_t US_RIGHT_ECHO = 34;
 const uint8_t US_FRONT_TRIG = 37;
 const uint8_t US_FRONT_ECHO = 39;
+const uint8_t REVIVE_BUTTON_PIN = 32;
+const uint8_t KILL_BUTTON_PIN = 45;
+const uint8_t LED_RED_PIN = 36;
+const uint8_t LED_GREEN_PIN = 38;
 
 const unsigned int SENSOR_TIMEOUT_US = 3000;
 const unsigned int LINE_THRESHOLD = 760;
@@ -84,6 +96,7 @@ const bool BLACK_LINE_IS_HIGH = true;
 
 const bool SENSOR_DEBUG_MODE = false;
 const bool ENABLE_LINE_CORRECTION = true;
+const bool USE_RFID = true;
 
 const int16_t MAX_SPEED = 1000;
 const int16_t FORWARD_SPEED = 700;
@@ -108,6 +121,18 @@ const float RIGHT_ANGLE_SLOW_DOWN_DEG = 70.0;
 const int16_t FIND_LINE_SPEED = 800;
 const uint16_t FIND_LINE_SMALL_MS = 150;
 const uint16_t FIND_LINE_BIG_MS = 650;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long KILL_BLINK_MS = 250;
+const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
+const unsigned long RFID_CHECK_INTERVAL_MS = 80;
+
+struct DebouncedButton
+{
+  uint8_t pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastChangeMs;
+};
 
 unsigned int sensorValues[SENSOR_COUNT];
 bool sensorOnLine[SENSOR_COUNT];
@@ -117,11 +142,22 @@ int correctionDirection = 0;
 uint16_t activeCorrectionPulseMs = CORRECTION_PULSE_MS;
 unsigned long stateStartMs = 0;
 unsigned long lastPrintMs = 0;
+unsigned long killPauseStartMs = 0;
+unsigned long lastBlinkMs = 0;
+unsigned long lastRFIDRetryMs = 0;
+unsigned long lastRFIDCheckMs = 0;
 unsigned long ignoreRightAngleUntilMs = 0;
 int lastTurnDirection = 0; // -1 = left, 1 = right
 uint8_t completedRouteTurns = 0;
 int pendingTurnDirection = 0; // -1 = left, 1 = right
 int findLineFirstDirection = 0; // -1 = left first, 1 = right first
+bool killStopped = false;
+bool isRevived = false;
+bool redBlinkEnabled = false;
+bool blinkRedOn = false;
+bool rfidReady = false;
+DebouncedButton reviveButton = {REVIVE_BUTTON_PIN, HIGH, HIGH, 0};
+DebouncedButton killButton = {KILL_BUTTON_PIN, HIGH, HIGH, 0};
 
 enum RobotState
 {
@@ -160,6 +196,117 @@ void setMotorSpeeds(int16_t rf, int16_t rr, int16_t lr, int16_t lf)
 void stopAllMotors()
 {
   setMotorSpeeds(0, 0, 0, 0);
+}
+
+void beginButton(DebouncedButton &button)
+{
+  pinMode(button.pin, INPUT_PULLUP);
+  button.stableState = digitalRead(button.pin);
+  button.lastReading = button.stableState;
+  button.lastChangeMs = millis();
+}
+
+bool buttonPressed(DebouncedButton &button)
+{
+  bool reading = digitalRead(button.pin);
+  if (reading != button.lastReading)
+  {
+    button.lastChangeMs = millis();
+    button.lastReading = reading;
+  }
+
+  if ((millis() - button.lastChangeMs) > DEBOUNCE_MS && reading != button.stableState)
+  {
+    button.stableState = reading;
+    return button.stableState == LOW;
+  }
+
+  return false;
+}
+
+void updateLed()
+{
+  if (redBlinkEnabled)
+  {
+    if (millis() - lastBlinkMs >= KILL_BLINK_MS)
+    {
+      lastBlinkMs = millis();
+      blinkRedOn = !blinkRedOn;
+    }
+    digitalWrite(LED_RED_PIN, blinkRedOn ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    return;
+  }
+
+  digitalWrite(LED_RED_PIN, isRevived ? LOW : HIGH);
+  digitalWrite(LED_GREEN_PIN, isRevived ? HIGH : LOW);
+}
+
+void setKillStopped(bool stopped, const char *source)
+{
+  if (stopped == killStopped)
+  {
+    if (stopped)
+    {
+      stopAllMotors();
+    }
+    return;
+  }
+
+  killStopped = stopped;
+
+  Serial.print("KILL | ");
+  Serial.print(source);
+  Serial.print(" -> ");
+  Serial.println(killStopped ? "STOP" : "RUN");
+
+  if (killStopped)
+  {
+    isRevived = false;
+    redBlinkEnabled = true;
+    blinkRedOn = true;
+    lastBlinkMs = millis();
+    killPauseStartMs = millis();
+    stopAllMotors();
+  }
+  else
+  {
+    redBlinkEnabled = false;
+    if (killPauseStartMs != 0)
+    {
+      stateStartMs += millis() - killPauseStartMs;
+      killPauseStartMs = 0;
+    }
+    lastUpdateMicros = micros();
+  }
+}
+
+void setReviveLedGreen(const char *source)
+{
+  isRevived = true;
+  redBlinkEnabled = false;
+
+  Serial.print("REVIVE | ");
+  Serial.print(source);
+  Serial.println(" -> LED GREEN");
+}
+
+void updateButtons()
+{
+  if (digitalRead(REVIVE_BUTTON_PIN) == LOW)
+  {
+    setReviveLedGreen("D32 level");
+  }
+
+  if (buttonPressed(reviveButton))
+  {
+    setReviveLedGreen("D32");
+  }
+
+  if (buttonPressed(killButton))
+  {
+    setKillStopped(!killStopped, "Mechanical D45");
+  }
 }
 
 void driveBySide(int16_t leftSpeed, int16_t rightSpeed)
@@ -868,6 +1015,131 @@ void findLineStep(bool turnLeft, uint16_t durationMs, RobotState nextState)
   }
 }
 
+bool initRFIDNoResetPin()
+{
+  Wire1.beginTransmission(RFID_I2C_ADDR);
+  if (Wire1.endTransmission() != 0)
+  {
+    Serial.println("RFID | Not found at I2C address 0x28.");
+    return false;
+  }
+
+  // Same core setup as MFRC522_I2C::PCD_Init(), but without touching reset pin.
+  mfrc522.PCD_Reset();
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TModeReg, 0x80);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TPrescalerReg, 0xA9);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegH, 0x03);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegL, 0xE8);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TxASKReg, 0x40);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::ModeReg, 0x3D);
+  mfrc522.PCD_AntennaOn();
+
+  byte version = mfrc522.PCD_ReadRegister(MFRC522_I2C::VersionReg);
+  Serial.print("RFID | Ready at 0x28, version register=0x");
+  if (version < 0x10)
+  {
+    Serial.print("0");
+  }
+  Serial.println(version, HEX);
+
+  if (version == 0x00 || version == 0xFF)
+  {
+    Serial.println("RFID | Version read failed. Check SDA1/SCL1, VCC, GND, and I2C address.");
+    return false;
+  }
+
+  return true;
+}
+
+void updateRFID()
+{
+  if (!USE_RFID)
+  {
+    return;
+  }
+
+  if (!rfidReady)
+  {
+    if (millis() - lastRFIDRetryMs >= RFID_RETRY_INTERVAL_MS)
+    {
+      lastRFIDRetryMs = millis();
+      rfidReady = initRFIDNoResetPin();
+    }
+    return;
+  }
+
+  if (millis() - lastRFIDCheckMs < RFID_CHECK_INTERVAL_MS)
+  {
+    return;
+  }
+  lastRFIDCheckMs = millis();
+
+  if (!mfrc522.PICC_IsNewCardPresent())
+  {
+    return;
+  }
+
+  if (!mfrc522.PICC_ReadCardSerial())
+  {
+    return;
+  }
+
+  Serial.print("RFID | Card ID:");
+  for (byte i = 0; i < mfrc522.uid.size; i++)
+  {
+    Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(mfrc522.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  mfrc522.PICC_HaltA();
+}
+
+void scanRFIDOnlyI2CBus()
+{
+  Serial.println("RFID_TEST | Scanning Wire1...");
+  uint8_t count = 0;
+
+  for (uint8_t address = 1; address < 127; address++)
+  {
+    Wire1.beginTransmission(address);
+    if (Wire1.endTransmission() == 0)
+    {
+      Serial.print("RFID_TEST | I2C found 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  if (count == 0)
+  {
+    Serial.println("RFID_TEST | No I2C devices found on Wire1.");
+  }
+}
+
+void setupRFIDOnlyTest()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire1.begin();
+  Wire1.setClock(400000);
+  scanRFIDOnlyI2CBus();
+
+  rfidReady = initRFIDNoResetPin();
+  Serial.println(rfidReady ? "RFID_TEST | Ready. Tap a card." : "RFID_TEST | Init failed, retrying in loop.");
+}
+
+void loopRFIDOnlyTest()
+{
+  updateRFID();
+  delay(10);
+}
+
 void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0)
 {
   mc.setBus(&Wire1);
@@ -893,8 +1165,22 @@ void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0)
 
 void setup()
 {
+  if (RFID_ONLY_TEST)
+  {
+    setupRFIDOnlyTest();
+    return;
+  }
+
   Serial.begin(115200);
   delay(1000);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  beginButton(reviveButton);
+  beginButton(killButton);
 
   Wire.begin();
   Wire.setClock(400000);
@@ -915,6 +1201,11 @@ void setup()
 
   stopAllMotors();
 
+  if (USE_RFID)
+  {
+    rfidReady = initRFIDNoResetPin();
+  }
+
   Serial.println("IMU | Keep car still for gyro calibration.");
   delay(1000);
   calibrateGyroZ();
@@ -924,14 +1215,37 @@ void setup()
 
   Serial.println("Line follower ready. Lower=0x10, Upper=0x11, IMU right-angle turns enabled.");
   Serial.println("Correction enabled: side sensors correct; strong outer sensors trigger 90-degree IMU turns.");
+  Serial.println("MECH | D45 toggles movement stop/run. D32 controls LED green only. Red=D36, Green=D38.");
+  Serial.println(USE_RFID ? "RFID | Enabled on SDA1/SCL1, address 0x28." : "RFID | Disabled.");
   delay(1000);
+
+  if (killButton.stableState == LOW)
+  {
+    setKillStopped(true, "Mechanical boot D45");
+  }
 
   enterState(SENSE_LINE);
 }
 
 void loop()
 {
+  if (RFID_ONLY_TEST)
+  {
+    loopRFIDOnlyTest();
+    return;
+  }
+
+  updateButtons();
+  updateLed();
   updateYaw();
+  updateRFID();
+
+  if (killStopped)
+  {
+    stopAllMotors();
+    delay(5);
+    return;
+  }
 
   switch (state)
   {
