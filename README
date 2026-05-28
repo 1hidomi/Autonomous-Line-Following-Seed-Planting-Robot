@@ -4,6 +4,9 @@
 ├── README.md                      # Setup and documentation manual
 ├── software_overview_diagram      # Software architecture diagram
 ├── flowcharts                     # Robot decision-flow diagrams
+    └─ mechanical_kill_switch.png
+    └─ RFID_planting.png
+    └─ line_following.png
 └── Testing_Calibration_Evidence   # Sensor, motor, IMU, and field-test evidence
 
 Current development note: this repository is still maintained in PlatformIO as `src/main.cpp`. For final Arduino IDE submission, copy the validated deployment code into `final.ino` and keep `secrets.h` in the same sketch folder.
