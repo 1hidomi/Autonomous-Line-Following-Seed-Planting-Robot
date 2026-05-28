@@ -1,24 +1,14 @@
-# Final Robot Setup Manual
+1. Repository Structure
 
-## 1. Repository Structure
-
-```text
-├── final.ino                   # Main Arduino deployment script
-│   └── secrets.h               # Network and MQTT credentials configuration
+├── latest.ino                  # Main Arduino deployment script
 ├── README.md                   # Setup and documentation manual
 ├── software_overview_diagram   # Software architecture diagram
 ├── flowcharts                  # Robot decision-flow diagrams
 └── calibration_evidence        # Sensor, motor, IMU, and field-test evidence
-```
 
-Current development note: this repository is still maintained in PlatformIO as
-`src/main.cpp`. For final Arduino IDE submission, copy the validated deployment
-code into `final.ino` and keep `secrets.h` in the same sketch folder.
+Current development note: this repository is still maintained in PlatformIO as `src/main.cpp`. For final Arduino IDE submission, copy the validated deployment code into `final.ino` and keep `secrets.h` in the same sketch folder.
 
-## 2. Required Libraries
-
-Before compiling the code, open Arduino IDE Library Manager and install the
-following dependencies:
+2. Required Libraries
 
 - `MiniMessenger` - Official challenge communication library.
 - `ArduinoMqttClient` - Core dependency required by MiniMessenger.
@@ -28,31 +18,24 @@ following dependencies:
 - `Servo` - Standard Arduino library used to control the 360-degree continuous rotation micro servo.
 - `Wire` and `Arduino` - Built-in core frameworks for standard I2C communication and Arduino GIGA pin mappings.
 
-## 3. Setup Steps
+3. Setup Steps
 
-### Step 1: Configure Your Secrets File
+Step 1: Configure Your Secrets File
 
-Create a new tab in the Arduino IDE named `secrets.h` inside the final robot
-sketch folder. Copy and paste the lab network credentials below:
+Create a new tab in the Arduino IDE named `secrets.h` inside the sketch folder. Copy and paste the lab network credentials below:
 
-```cpp
 #define WIFI_SSID "PhaseSpaceNetwork_2.4G"
 #define WIFI_PASSWORD "8igMacNet"
 #define BROKER_HOST "192.168.0.74"
 #define BROKER_PORT 1883
 #define GROUP_ID "5"
 #define BOARD_ID "Thomas"
-```
 
-`BOARD_ID` should be short and contain no spaces. If the team changes the robot
-name, update only this field.
-
-### Step 2: Hardware Interfacing Checklist
+Step 2: Hardware Interfacing Checklist
 
 Ensure all onboard modules are correctly connected to the Arduino GIGA R1.
 
-#### Motoron Shields
-
+Motoron Shields
 - I2C SDA -> `SDA1`
 - I2C SCL -> `SCL1`
 - Lower Motoron address: `0x10`
@@ -62,17 +45,14 @@ Ensure all onboard modules are correctly connected to the Arduino GIGA R1.
 - Lower Motoron M3 -> LR motor
 - Upper Motoron M1 -> LF motor
 
-#### RFID Sensor
-
+RFID Sensor
 - VCC -> `5V`
 - GND -> `GND`
 - SDA -> `SDA1`
 - SCL -> `SCL1`
 - I2C address: `0x28`
-- Reset pin: not connected; the code uses software reset.
 
-#### Reflectance Sensor Array
-
+Reflectance Sensor Array
 - VCC -> `3.3V`
 - GND -> `GND`
 - Out 1 -> `D22`
@@ -80,13 +60,9 @@ Ensure all onboard modules are correctly connected to the Arduino GIGA R1.
 - Out 5 -> `D26`
 - Out 7 -> `D28`
 - Out 9 -> `D31`
+The line-following logic uses Out 1/3/5/7/9 as the main five logical points: right, slight-right, middle, slight-left, and left. Out 2/4/6/8 are available for debugging and future stability improvements.
 
-The line-following logic uses Out 1/3/5/7/9 as the main five logical points:
-right, slight-right, middle, slight-left, and left. Out 2/4/6/8 are available
-for debugging and future stability improvements.
-
-#### Ultrasonic Sensors
-
+Ultrasonic Sensors
 - VCC -> `5V`
 - GND -> `GND`
 - Front Echo -> `D37`
@@ -96,89 +72,38 @@ for debugging and future stability improvements.
 - Right Echo -> `D46`
 - Right Trig -> `D48`
 
-Do not use `D31` for ultrasonic triggering, because `D31` is assigned to
-reflectance sensor Out 9.
-
-#### Revive Button
-
+Revive Button
 - One side -> `GND`
 - Other side -> `D32`
 
-#### Mechanical Kill Switch Button
-
+Mechanical Kill Switch Button
 - One side -> `GND`
 - Other side -> `D45`
 
-#### Status LEDs
-
+Status LED
 - Red LED -> `D36`
 - Green LED -> `D38`
 
-#### Servo Motor
-
+Servo Motor
 - Signal -> `D10`
 - VCC -> `5V`
 - GND -> `GND`
 
-Servo signal was moved from `D7` to `D10` because `D6` and `D7` are difficult
-to access and are also kept available for encoder-related wiring.
-
-## 4. How to Upload and Run the Code
-
-### Uploading to the Board
+4. Upload and run the code
 
 - Connect the Arduino GIGA R1 WiFi to the computer using a reliable USB-C cable.
-- In the Arduino IDE, go to `Tools -> Board` and select:
-  `Arduino Mbed OS GIGA Boards -> Arduino GIGA R1`.
+- In the Arduino IDE, go to `Tools -> Board` and select: `Arduino Mbed OS GIGA Boards -> Arduino GIGA R1`.
 - Go to `Tools -> Port` and select the active COM port assigned to the GIGA.
 - Click the Verify checkmark button to compile.
 - Click Upload to flash the code to the robot.
 - Open Serial Monitor at `115200` baud.
 
-For PlatformIO development, the equivalent upload command is:
+For PlatformIO development, the equivalent upload command is: /Users/admin/.platformio/penv/bin/platformio run --target upload
+The serial monitor command is: /Users/admin/.platformio/penv/bin/platformio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
 
-```bash
-/Users/admin/.platformio/penv/bin/platformio run --target upload
-```
-
-The serial monitor command is:
-
-```bash
-/Users/admin/.platformio/penv/bin/platformio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
-```
-
-### Running and Testing the Kill Switch
-
-- Connect the laptop or debugging device to the lab network:
-  `PhaseSpaceNetwork_2.4G`.
-- Open the team dashboard:
-  `http://192.168.0.74:8090/team/5`
+Running and testing the Wifi kill switch
+- Connect the laptop or debugging device to the lab network: `PhaseSpaceNetwork_2.4G`.
+- Open the team dashboard: `http://192.168.0.74:8090/team/5`
 - Use the dashboard Enable/Disable buttons to test remote safety stop.
-- The robot must continuously call `messenger.loop()` inside the main loop so
-  MiniMessenger can intercept emergency payloads.
+- The robot must continuously call `messenger.loop()` inside the main loop so MiniMessenger can intercept emergency payloads.
 - On emergency disable, the robot should call `stopAllMotors()` immediately.
-
-Mechanical kill switch testing:
-
-- Press the D45 kill button once to stop the robot.
-- Press D45 again to allow movement.
-- When stopped, the red LED should blink.
-- The D32 revive button controls the green LED indication.
-
-Expected serial messages:
-
-```text
-KILL | Mechanical D45 -> STOP
-KILL | Mechanical D45 -> RUN
-RFID | Card ID: ...
-```
-
-## 5. Current Development Notes
-
-- Current development code may still use `src/main.cpp`; final deployment should
-  be consolidated into `final.ino`.
-- If RFID-only testing is enabled with `RFID_ONLY_TEST = true`, the robot will
-  not run motors or line following. Set it to `false` before a full robot run.
-- Reflectance sensor Out 9 is connected to `D31`.
-- Servo signal should use `D10`.
-- MiniMessenger/MQTT is required for the final remote kill switch behaviour.
