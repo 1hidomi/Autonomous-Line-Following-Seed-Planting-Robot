@@ -59,6 +59,7 @@ const unsigned long ULTRASONIC_SENSOR_GAP_MS = 30;
 const unsigned long CONTROL_INTERVAL_MS = 35;
 const unsigned long STATUS_INTERVAL_MS = 150;
 const unsigned long RUN_TIME_LIMIT_MS = 45000;
+const unsigned long STARTUP_BLINK_MS = 300;
 const float ULTRASONIC_FILTER_ALPHA = 0.42;
 
 struct UltrasonicSensor
@@ -93,6 +94,10 @@ unsigned long lastStatusMs = 0;
 unsigned long runStartMs = 0;
 bool runEnabled = true;
 bool runComplete = false;
+bool startupWaiting = true;
+bool startupRedOn = true;
+bool ignoreD45UntilReleased = false;
+unsigned long startupLastBlinkMs = 0;
 float lastWallError = 0.0;
 unsigned long lastWallErrorMs = 0;
 bool hasLastWallError = false;
@@ -358,7 +363,14 @@ float computeWallError(FollowMode mode, float leftCm, float rightCm, float &kp)
 
 void updateButtons()
 {
-  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  if (ignoreD45UntilReleased)
+  {
+    if (digitalRead(KILL_BUTTON_PIN) == HIGH)
+    {
+      ignoreD45UntilReleased = false;
+    }
+  }
+  else if (digitalRead(KILL_BUTTON_PIN) == LOW)
   {
     if (runEnabled)
     {
@@ -380,8 +392,41 @@ void updateButtons()
     lastWallCorrection = 0;
   }
 
-  digitalWrite(LED_RED_PIN, runEnabled && !runComplete ? LOW : HIGH);
-  digitalWrite(LED_GREEN_PIN, runEnabled && !runComplete ? HIGH : LOW);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+}
+
+bool handleStartupWait()
+{
+  if (!startupWaiting)
+  {
+    return false;
+  }
+
+  stopAllMotors();
+  if (millis() - startupLastBlinkMs >= STARTUP_BLINK_MS)
+  {
+    startupLastBlinkMs = millis();
+    startupRedOn = !startupRedOn;
+  }
+  digitalWrite(LED_RED_PIN, startupRedOn ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    startupWaiting = false;
+    ignoreD45UntilReleased = true;
+    runEnabled = true;
+    runComplete = false;
+    runStartMs = millis();
+    hasLastWallError = false;
+    lastWallCorrection = 0;
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    Serial.println("STARTUP | D45 pressed. Algorithm enabled.");
+  }
+
+  return true;
 }
 
 void printStatus(float frontCm, float leftCm, float rightCm, float error, float kp, int16_t correction, int16_t leftSpeed, int16_t rightSpeed)
@@ -536,11 +581,14 @@ void setup()
   stopAllMotors();
 
   updateAllUltrasonicBlocking();
-  runEnabled = digitalRead(KILL_BUTTON_PIN) != LOW;
+  runEnabled = false;
+  startupWaiting = true;
+  startupRedOn = true;
+  startupLastBlinkMs = millis();
   runStartMs = millis();
 
   Serial.println("WALL_FOLLOWING | Ready.");
-  Serial.println("WALL_FOLLOWING | D45 stop, D32 run/resume.");
+  Serial.println("WALL_FOLLOWING | Startup: motors stopped, red blinks. Press D45 once to start.");
   Serial.print("WALL_FOLLOWING | target=");
   Serial.print(WALL_TARGET_CM, 1);
   Serial.print("cm minClearance=");
@@ -552,6 +600,13 @@ void setup()
 void loop()
 {
   updateOneUltrasonic();
+
+  if (handleStartupWait())
+  {
+    delay(5);
+    return;
+  }
+
   updateButtons();
 
   if (runComplete)
