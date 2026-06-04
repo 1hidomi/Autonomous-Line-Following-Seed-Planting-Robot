@@ -1,11 +1,5 @@
-
-// VERSION: LINE_FOLLOWER_9OUT_AUTO_BRANCH_TEST_WIFI_OPTION_V6
-// Loaded from saved_versions/line_follower_working_2026-05-19.cpp.
-// Current test changes: 9-output reflectance auto branch test, optional server mode.
-// When an outer sensor sees a strong branch, move forward a little, read the
-// branch pattern, then turn left or right if forward is not available.
-
 #include <Arduino.h>
+
 #include <math.h>
 #include <Wire.h>
 #include <Motoron.h>
@@ -17,7 +11,7 @@
 
 const bool SERVO_TEST = false;
 const bool USE_SEED_PLANTER = true;
-const bool OFFLINE_MODE = true; // true = no WiFi/server; RFID uses local fallback.
+const bool OFFLINE_MODE = false; // true = no WiFi/server; RFID uses local fallback.
 const bool USE_SERVER_MESSENGER = !OFFLINE_MODE;
 const bool ALLOW_LOCAL_RFID_FALLBACK = OFFLINE_MODE;
 const bool RFID_ONLY_TEST = false;
@@ -109,6 +103,7 @@ const unsigned long PLANTER_END_PAUSE_MS = 500;
 const unsigned long RFID_PLANT_COOLDOWN_MS = 3000;
 const unsigned long RFID_PAUSE_MS = 1000;
 const unsigned long RFID_CARD_ACTION_COOLDOWN_MS = 2500;
+const unsigned long RFID_SAME_CARD_ACTION_COOLDOWN_MS = 30000;
 const unsigned long SERVER_REGISTER_INTERVAL_MS = 10000;
 const unsigned long SERVER_REPLY_TIMEOUT_MS = 1800;
 const unsigned long SERVER_STATUS_INTERVAL_MS = 2000;
@@ -116,7 +111,11 @@ const size_t RFID_TAG_ID_MAX_LEN = 24;
 const char *SERVER_TARGET_BOARD = "server";
 const char *SERVER_AIRLOCK_OPEN_TYPE = "openAirlock";
 const char *SERVER_AIRLOCK_ID = "A";
+const int8_t RETURN_EXIT_X = 9;
+const int8_t RETURN_EXIT_Y = 7;
 const float OBSTACLE_TURN_DISTANCE_CM = 10.0;
+const uint16_t FRONT_OBSTACLE_RECOVERY_MS = 1200;
+const uint16_t LINE_LOST_STOP_RECOVERY_MS = 500;
 const bool USE_GRID_OBSTACLE_AVOIDANCE = false;
 const float GRID_OBSTACLE_DETECT_CM = 15.0;
 const int16_t GRID_OBSTACLE_FORWARD_SPEED = 650;
@@ -140,11 +139,14 @@ const float WALL_TARGET_CM = 15.0;
 const float WALL_TOLERANCE_CM = 3.0;
 
 const unsigned int SENSOR_TIMEOUT_US = 3000;
-const unsigned int LINE_THRESHOLD = 280;
+// Line acquisition is deliberately more permissive than corner detection.
+// The lowered reflectance board reports the black line near 250-400us, while
+// the bare floor is typically far lower. Keep turn detection strict below.
+const unsigned int LINE_THRESHOLD = 220;
 const unsigned int SIDE_CORRECTION_THRESHOLD = 430;
 const unsigned int TURN_CORNER_SIDE_THRESHOLD = 300;       
 const unsigned int T_JUNCTION_SIDE_THRESHOLD = 240;  // T needs both side pairs, so this can be lower than corner.
-const unsigned int TURN_CORNER_CENTER_THRESHOLD = LINE_THRESHOLD;
+const unsigned int TURN_CORNER_CENTER_THRESHOLD = 280;
 const int TURN_CORNER_SCORE_MIN = 650;
 const int T_JUNCTION_SCORE_MIN = 460;
 const bool ENABLE_T_JUNCTION_LATCH = true;
@@ -174,8 +176,8 @@ const bool RFID_VERBOSE_DEBUG = false;
 const int16_t MAX_SPEED = 1100;
 // Conservative speed pass after the motor swap: line tracking is slowed more
 // than turning so the new motor response can be re-calibrated safely.
-const int16_t FORWARD_SPEED = 240;
-const int16_t POST_TURN_FINE_FORWARD_SPEED = 290;
+const int16_t FORWARD_SPEED = 210;
+const int16_t POST_TURN_FINE_FORWARD_SPEED = 250;
 const int16_t POST_TURN_FINE_CORRECTION_SPEED = 520;
 const int16_t MIN_CORRECTION_SPEED = 520;
 const int16_t PIVOT_SPEED = 560;
@@ -183,6 +185,14 @@ const int16_t RIGHT_ANGLE_FAST_SPEED = 560;
 const int16_t RIGHT_ANGLE_MID_SPEED = 500;
 const int16_t RIGHT_ANGLE_FINE_SPEED = 340;
 const int16_t RIGHT_ANGLE_RELIEF_SPEED = 420;
+const int16_t FIELD_FORWARD_SPEED = 180;
+const int16_t FIELD_POST_TURN_FINE_FORWARD_SPEED = 200;
+const int16_t FIELD_POST_TURN_VERIFY_SPEED = 300;
+const int16_t FIELD_FIND_LINE_SPEED = 360;
+const int16_t FIELD_NO_LINE_FORWARD_SPEED = 220;
+const int16_t FIELD_NO_LINE_YAW_MAX_CORRECTION = 60;
+const int16_t FIELD_LINE_PID_MAX_CORRECTION = 180;
+const uint8_t FIELD_TURN_SPEED_PERCENT = 80;
 const bool ENABLE_ENCODER_TURN_BALANCE = true;
 const uint16_t ENCODER_TURN_BALANCE_INTERVAL_MS = 120;
 const uint8_t ENCODER_TURN_BALANCE_MIN_MOVING_WHEELS = 3;
@@ -213,10 +223,10 @@ const uint8_t LEFT_PIVOT_RF_PERCENT = 100;
 const uint8_t LEFT_PIVOT_RR_PERCENT = 100;
 const uint8_t LEFT_PIVOT_LR_PERCENT = 100;
 const uint8_t LEFT_PIVOT_LF_PERCENT = 100;
-const int16_t NO_LINE_FORWARD_SPEED = 320;
+const int16_t NO_LINE_FORWARD_SPEED = 260;
 const int16_t NO_LINE_YAW_MAX_CORRECTION = 120;
 const float NO_LINE_YAW_KP = 18.0;
-const unsigned int LINE_PID_SIGNAL_FLOOR = 240;
+const unsigned int LINE_PID_SIGNAL_FLOOR = 180;
 const int LINE_PID_MIN_SIGNAL_TOTAL = 20;
 const int16_t LINE_PID_MAX_CORRECTION = 360;
 const int16_t POST_TURN_LINE_PID_MAX_CORRECTION = 260;
@@ -265,14 +275,25 @@ const float POST_TURN_MIN_TILT_DELTA_DEG = 4.0;
 const long POST_TURN_MIN_ENCODER_TICKS = 3;
 const int16_t POST_TURN_BACKUP_SPEED = 620;
 const uint16_t POST_TURN_BACKUP_MS = 320;
-const int16_t FIND_LINE_SPEED = 520;
-const int16_t WALL_FORWARD_SPEED = 620;
-const int16_t WALL_MIN_DRIVE_SPEED = 520;
+const int16_t FIND_LINE_SPEED = 440;
+const int16_t WALL_FORWARD_SPEED = 496;
+const int16_t WALL_MIN_DRIVE_SPEED = 416;
+const int16_t WALL_FIELD_APPROACH_SPEED = 380;
+const int16_t WALL_FIELD_APPROACH_MIN_SPEED = 300;
+const int16_t WALL_UPHILL_DOOR_HOLD_SPEED = 220;
+const float WALL_SPEED_DECEL_PER_SEC = 150.0;
+const float WALL_SPEED_ACCEL_PER_SEC = 260.0;
+const uint16_t WALL_CLIMB_POWER_MS = 3000;
+const uint16_t WALL_LINE_REACQUIRE_MIN_MS = 1800;
+const uint16_t WALL_LINE_REACQUIRE_STABLE_MS = 250;
+const uint16_t RETURN_BASE_REACQUIRE_SETTLE_MS = 500;
+const uint16_t RETURN_BASE_IGNORE_TURN_MS = 1600;
+const uint16_t RETURN_BASE_FINE_LINE_MS = 2500;
 const float WALL_MIN_SIDE_CLEARANCE_CM = 4.5;
 const float WALL_SIDE_CRITICAL_CM = 3.5;
 const float WALL_SIDE_VALID_MAX_CM = 60.0;
 const float WALL_CENTER_VALID_MAX_CM = 45.0;
-const float WALL_FRONT_SLOW_CM = 28.0;
+const float WALL_FRONT_SLOW_CM = 45.0;
 const float WALL_FRONT_STOP_CM = 15.0;
 const int16_t WALL_PD_MAX_CORRECTION = 320;
 const float WALL_CENTER_KP = 34.0;
@@ -283,7 +304,7 @@ const float NO_LINE_WALL_ENTRY_SIDE_CM = 14.0;
 const uint16_t NO_LINE_WALL_ENTRY_MIN_MS = 300;
 const uint16_t NO_LINE_RETURN_YAW_TIMEOUT_MS = 1800;
 const float NO_LINE_RETURN_YAW_TOLERANCE_DEG = 3.0;
-const int16_t NO_LINE_RETURN_YAW_SPEED = 520;
+const int16_t NO_LINE_RETURN_YAW_SPEED = 440;
 const bool ENABLE_UPHILL_LINE_FLICKER_GUARD = true;
 const uint16_t UPHILL_LINE_FLICKER_WINDOW_MS = 4500;
 const uint8_t UPHILL_LINE_FLICKER_TRIGGER_TRANSITIONS = 2;
@@ -294,12 +315,15 @@ const float UPHILL_ROLL_TRIGGER_DEG = 3.0;
 const float UPHILL_PITCH_TRIGGER_DEG = 3.5;
 const uint16_t UPHILL_TILT_GUARD_MIN_MS = 180;
 const uint16_t UPHILL_TILT_GUARD_COOLDOWN_MS = 2500;
-const uint16_t FIND_LINE_SMALL_MS = 700;
-const uint16_t FIND_LINE_BIG_MS = 2200;
-const float FIND_LINE_SMALL_SWEEP_DEG = 18.0;
-const float FIND_LINE_BIG_SWEEP_DEG = 45.0;
+const uint16_t FIND_LINE_SMALL_MS = 900;
+const uint16_t FIND_LINE_BIG_MS = 3000;
+const float FIND_LINE_SMALL_SWEEP_DEG = 24.0;
+const float FIND_LINE_BIG_SWEEP_DEG = 70.0;
 const unsigned long DEBOUNCE_MS = 50;
 const unsigned long KILL_BLINK_MS = 250;
+const unsigned long STARTUP_WIFI_SLOW_BLINK_MS = 800;
+const unsigned long STARTUP_WIFI_FAST_BLINK_MS = 150;
+const unsigned long EMERGENCY_LED_BLINK_MS = 180;
 const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
 const unsigned long RFID_CHECK_INTERVAL_MS = 80;
 const unsigned long RFID_DEBUG_INTERVAL_MS = 1000;
@@ -383,6 +407,7 @@ unsigned long lastSensorStatusMs = 0;
 unsigned long ignoreRightAngleUntilMs = 0;
 unsigned long postTurnFineLineUntilMs = 0;
 unsigned long frontObstacleHoldStartMs = 0;
+unsigned long ignoreFrontObstacleUntilMs = 0;
 uint8_t nextUltrasonicIndex = 0;
 float noLineTargetYawDeg = 0.0;
 bool noLineYawTargetLocked = false;
@@ -398,8 +423,11 @@ float uphillTiltGuardYawDeg = 0.0;
 float wallPdLastError = 0.0;
 unsigned long wallPdLastMs = 0;
 bool wallPdHasLast = false;
+float wallAppliedBaseSpeed = WALL_FORWARD_SPEED;
+unsigned long wallSpeedRampLastMs = 0;
 long wallFollowLastEncoderCounts[ENCODER_COUNT] = {0, 0, 0, 0};
 unsigned long wallFollowLastDebugMs = 0;
+unsigned long wallLineReacquireSinceMs = 0;
 int lastTurnDirection = 0; // -1 = left, 1 = right
 uint8_t completedRouteTurns = 0;
 int pendingTurnDirection = 0; // -1 = left, 1 = right
@@ -420,6 +448,7 @@ unsigned long planterPauseStartMs = 0;
 unsigned long lastPlantTriggerMs = 0;
 bool runRandomActionAfterPlant = false;
 bool killStopped = false;
+bool startupWaitActive = true;
 bool isRevived = false;
 bool redBlinkEnabled = false;
 bool blinkRedOn = false;
@@ -433,6 +462,8 @@ unsigned long airlockDirectTunnelEntryStartMs = 0;
 uint32_t lastRFIDUidHash = 0;
 bool haveLastRFIDUid = false;
 unsigned long lastRFIDUidMs = 0;
+uint32_t lastRFIDActionUidHash = 0;
+bool haveLastRFIDActionUid = false;
 char lastRFIDTagId[RFID_TAG_ID_MAX_LEN] = "";
 char activeRFIDTagId[RFID_TAG_ID_MAX_LEN] = "";
 char plantingSeedTagId[RFID_TAG_ID_MAX_LEN] = "";
@@ -453,6 +484,19 @@ bool serverFertile = false;
 bool serverPlanted = false;
 bool serverAirlockAccepted = false;
 bool serverShouldReportCurrentPlant = false;
+bool returnModeActive = false;
+bool returnPlanPending = false;
+bool returnPositionKnown = false;
+bool returnTunnelActive = false;
+bool returnTunnelSawNoLine = false;
+bool returnBaseReacquireSettleActive = false;
+bool fieldModeActive = false;
+bool fixedRecoveryActive = false;
+int fixedRecoveryTurnDirection = 0;
+int recoveryDirectionFallback = 1;
+int8_t returnGridX = -1;
+int8_t returnGridY = -1;
+int8_t gridHeading = 0; // 0=N, 1=E, 2=S, 3=W.
 uint32_t gridObstacleLastNodeUid = 0;
 bool gridObstacleHasLastNode = false;
 uint8_t gridObstacleNodeCount = 0;
@@ -600,6 +644,10 @@ void startAirlockUphillRouteTracking(const char *source);
 void recordAirlockRouteTurn(int direction);
 bool airlockDirectTunnelEntryDue();
 void enterAirlockDirectTunnelMode(const char *source);
+void planEmergencyReturn();
+void startFixedRecovery(const char *reason, int requestedDirection = 0);
+bool fieldNavigationActive();
+int returnCornerTurnDirectionRequested();
 
 uint16_t preTurnMsForCm(float distanceCm)
 {
@@ -921,9 +969,24 @@ bool buttonPressed(DebouncedButton &button)
 
 void updateLed()
 {
+  if (serverEmergencyActive)
+  {
+    if (millis() - lastBlinkMs >= EMERGENCY_LED_BLINK_MS)
+    {
+      lastBlinkMs = millis();
+      blinkRedOn = !blinkRedOn;
+    }
+    digitalWrite(LED_RED_PIN, blinkRedOn ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, blinkRedOn ? LOW : HIGH);
+    return;
+  }
+
   if (redBlinkEnabled)
   {
-    if (millis() - lastBlinkMs >= KILL_BLINK_MS)
+    const unsigned long blinkIntervalMs = startupWaitActive
+                                          ? (serverLastConnected ? STARTUP_WIFI_FAST_BLINK_MS : STARTUP_WIFI_SLOW_BLINK_MS)
+                                          : KILL_BLINK_MS;
+    if (millis() - lastBlinkMs >= blinkIntervalMs)
     {
       lastBlinkMs = millis();
       blinkRedOn = !blinkRedOn;
@@ -966,6 +1029,7 @@ void setKillStopped(bool stopped, const char *source)
   }
   else
   {
+    startupWaitActive = false;
     redBlinkEnabled = false;
     if (killPauseStartMs != 0)
     {
@@ -1071,6 +1135,17 @@ bool parseBoolField(const char *message, const char *key, bool &value)
   return false;
 }
 
+bool parseIntField(const char *message, const char *key, int &value)
+{
+  char text[16];
+  if (!extractField(message, key, text, sizeof(text)))
+  {
+    return false;
+  }
+  value = atoi(text);
+  return true;
+}
+
 bool messageTypeEquals(const char *message, const char *expectedType)
 {
   char type[32];
@@ -1155,6 +1230,7 @@ void setupServerMessenger()
                                          BROKER_PORT,
                                          GROUP_ID,
                                          BOARD_ID);
+  serverLastConnected = connected;
 
   Serial.print("SERVER | MiniMessenger ");
   Serial.print(connected ? "connected" : "connecting");
@@ -1244,8 +1320,14 @@ void onServerMessage(const MessageMetadata &metadata, const uint8_t *payload, si
       serverEmergencyActive = enabled;
       if (enabled)
       {
+        blinkRedOn = true;
+        lastBlinkMs = millis();
         stopAllMotors();
-        Serial.println("SERVER | Emergency stop active.");
+        returnModeActive = true;
+        returnTunnelActive = false;
+        returnTunnelSawNoLine = false;
+        returnPlanPending = true;
+        Serial.println("SERVER | Emergency active. Stop current action and return to (9,7).");
       }
       else
       {
@@ -1283,6 +1365,20 @@ void onServerMessage(const MessageMetadata &metadata, const uint8_t *payload, si
 
     serverFertile = haveFertile && fertile;
     serverPlanted = havePlanted && planted;
+    int x = -1;
+    int y = -1;
+    if (parseIntField(message, "x", x) && parseIntField(message, "y", y))
+    {
+      returnGridX = (int8_t)x;
+      returnGridY = (int8_t)y;
+      returnPositionKnown = true;
+      Serial.print("LOCALIZE | x=");
+      Serial.print(returnGridX);
+      Serial.print(" y=");
+      Serial.print(returnGridY);
+      Serial.print(" heading=");
+      Serial.println(gridHeading);
+    }
     serverRfidReplyReceived = true;
 
     Serial.print("SERVER | Fertility reply fertile=");
@@ -1317,7 +1413,7 @@ bool serverStopActive()
 {
   return USE_SERVER_MESSENGER &&
          serverMessengerStarted &&
-         (!serverHeartbeatAllowsMovement || serverEmergencyActive || serverDisableActive);
+         (!serverHeartbeatAllowsMovement || serverDisableActive);
 }
 
 void driveBySide(int16_t leftSpeed, int16_t rightSpeed)
@@ -1914,6 +2010,44 @@ int rightAngleTurnDirectionRequested()
   return 0;
 }
 
+int returnCornerTurnDirectionRequested()
+{
+  bool centerOnLine = sensorValues[SENSOR_MIDDLE] >= TURN_CORNER_CENTER_THRESHOLD;
+  int rightScore = sensorValues[SENSOR_RIGHT] + sensorValues[SENSOR_SLIGHT_RIGHT];
+  int leftScore = sensorValues[SENSOR_SLIGHT_LEFT] + sensorValues[SENSOR_LEFT];
+  bool rightPairPresent = sensorValues[SENSOR_RIGHT] >= TURN_CORNER_SIDE_THRESHOLD &&
+                          sensorValues[SENSOR_SLIGHT_RIGHT] >= TURN_CORNER_SIDE_THRESHOLD;
+  bool leftPairPresent = sensorValues[SENSOR_SLIGHT_LEFT] >= TURN_CORNER_SIDE_THRESHOLD &&
+                         sensorValues[SENSOR_LEFT] >= TURN_CORNER_SIDE_THRESHOLD;
+
+  if (centerOnLine &&
+      rightPairPresent &&
+      !leftPairPresent &&
+      rightScore >= TURN_CORNER_SCORE_MIN &&
+      rightScore - leftScore >= TURN_CORNER_SCORE_MARGIN)
+  {
+    Serial.println("RETURN | Forced single-path RIGHT corner detected.");
+    return 1;
+  }
+
+  if (centerOnLine &&
+      leftPairPresent &&
+      !rightPairPresent &&
+      leftScore >= TURN_CORNER_SCORE_MIN &&
+      leftScore - rightScore >= TURN_CORNER_SCORE_MARGIN)
+  {
+    Serial.println("RETURN | Forced single-path LEFT corner detected.");
+    return -1;
+  }
+
+  return 0;
+}
+
+bool fieldNavigationActive()
+{
+  return !returnTunnelActive && (fieldModeActive || returnModeActive);
+}
+
 void resetLinePid()
 {
   linePidIntegral = 0.0;
@@ -1978,15 +2112,21 @@ void driveLinePid(float error)
   float correctionFloat = LINE_PID_KP * error +
                           LINE_PID_KI * linePidIntegral +
                           LINE_PID_KD * derivative;
-  int16_t maxCorrection = postTurnFineLineActive()
-                              ? POST_TURN_LINE_PID_MAX_CORRECTION
-                              : LINE_PID_MAX_CORRECTION;
+  int16_t maxCorrection = fieldNavigationActive()
+                              ? FIELD_LINE_PID_MAX_CORRECTION
+                              : (postTurnFineLineActive()
+                                     ? POST_TURN_LINE_PID_MAX_CORRECTION
+                                     : LINE_PID_MAX_CORRECTION);
   float limitedCorrection = constrain(
       correctionFloat,
       (float)-maxCorrection,
       (float)maxCorrection);
   int16_t correction = (int16_t)limitedCorrection;
-  int16_t baseSpeed = postTurnFineLineActive() ? POST_TURN_FINE_FORWARD_SPEED : FORWARD_SPEED;
+  int16_t baseSpeed = postTurnFineLineActive()
+                          ? (fieldNavigationActive()
+                                 ? FIELD_POST_TURN_FINE_FORWARD_SPEED
+                                 : POST_TURN_FINE_FORWARD_SPEED)
+                          : (fieldNavigationActive() ? FIELD_FORWARD_SPEED : FORWARD_SPEED);
   int16_t leftSpeed = constrain((int16_t)(baseSpeed - correction), -MAX_SPEED, MAX_SPEED);
   int16_t rightSpeed = constrain((int16_t)(baseSpeed + correction), -MAX_SPEED, MAX_SPEED);
 
@@ -2038,7 +2178,9 @@ void linePidFollowStep()
   bool allowRightAngle = ENABLE_RIGHT_ANGLE_TURNS && millis() >= ignoreRightAngleUntilMs;
   if (allowRightAngle)
   {
-    int turnDirection = rightAngleTurnDirectionRequested();
+    int turnDirection = returnModeActive
+                            ? returnCornerTurnDirectionRequested()
+                            : rightAngleTurnDirectionRequested();
     if (turnDirection < 0)
     {
       resetLinePid();
@@ -2058,6 +2200,14 @@ void linePidFollowStep()
   {
     resetLinePid();
     stopAllMotors();
+    if (returnModeActive && returnPositionKnown && returnGridY > 4)
+    {
+      noLineTargetYawDeg = yawDeg;
+      noLineYawTargetLocked = true;
+      Serial.println("RETURN | Open field: hold heading until next RFID.");
+      enterState(NO_LINE_IMU_FORWARD);
+      return;
+    }
     if (recordUphillTiltTransition("SENSE_TILT_LOST") ||
         recordUphillLineFlicker(false, "SENSE_LOST"))
     {
@@ -2283,7 +2433,24 @@ void printSensorStatus()
   Serial.print(" | Planter=");
   Serial.print(planterStateName());
   Serial.print(" | State=");
-  Serial.println(stateName(state));
+  Serial.print(stateName(state));
+  if (returnModeActive)
+  {
+    Serial.print(" | RETURN pos=");
+    if (returnPositionKnown)
+    {
+      Serial.print(returnGridX);
+      Serial.print(",");
+      Serial.print(returnGridY);
+    }
+    else
+    {
+      Serial.print("?");
+    }
+    Serial.print(" heading=");
+    Serial.print(gridHeading);
+  }
+  Serial.println();
 }
 
 void printStateThrottled()
@@ -2368,10 +2535,58 @@ bool gridObstacleDetectedAhead(float distanceCm)
   return distanceCm > 0.0 && distanceCm <= GRID_OBSTACLE_DETECT_CM;
 }
 
+int chooseFixedRecoveryTurnDirection()
+{
+  float leftCm = ultrasonicSensors[1].distanceCm;
+  float rightCm = ultrasonicSensors[2].distanceCm;
+  bool leftValid = leftCm > 0.0;
+  bool rightValid = rightCm > 0.0;
+
+  if (leftValid && rightValid && fabs(leftCm - rightCm) >= 3.0)
+  {
+    return leftCm > rightCm ? -1 : 1;
+  }
+
+  if (leftValid != rightValid)
+  {
+    return leftValid ? -1 : 1;
+  }
+
+  int direction = recoveryDirectionFallback;
+  recoveryDirectionFallback = -recoveryDirectionFallback;
+  return direction;
+}
+
+void startFixedRecovery(const char *reason, int requestedDirection)
+{
+  stopAllMotors();
+  frontObstacleHolding = false;
+  fixedRecoveryActive = true;
+  fixedRecoveryTurnDirection = requestedDirection == 0
+                                   ? chooseFixedRecoveryTurnDirection()
+                                   : (requestedDirection < 0 ? -1 : 1);
+  lastTurnDirection = fixedRecoveryTurnDirection;
+
+  Serial.print("RECOVERY_FIXED | reason=");
+  Serial.print(reason);
+  Serial.print(" backup=");
+  Serial.print(POST_TURN_BACKUP_MS);
+  Serial.print("ms uturn=");
+  Serial.print(fixedRecoveryTurnDirection < 0 ? "LEFT" : "RIGHT");
+  Serial.println(" then offline/no-line navigation.");
+
+  enterState(POST_TURN_BACK_UP);
+}
+
 bool handleFrontObstacle()
 {
   if (!USE_FRONT_OBSTACLE_AVOIDANCE)
   {
+    return false;
+  }
+  if (millis() < ignoreFrontObstacleUntilMs)
+  {
+    frontObstacleHolding = false;
     return false;
   }
 
@@ -2387,13 +2602,21 @@ bool handleFrontObstacle()
   if (distanceBlocked(ultrasonicSensors[0].distanceCm))
   {
     stopAllMotors();
+    bool newlyBlocked = !frontObstacleHolding;
 
-    if (!frontObstacleHolding)
+    if (newlyBlocked)
     {
       frontObstacleHoldStartMs = millis();
     }
 
-    if (!frontObstacleHolding || millis() - lastSensorStatusMs >= SENSOR_STATUS_INTERVAL_MS)
+    frontObstacleHolding = true;
+    if (millis() - frontObstacleHoldStartMs >= FRONT_OBSTACLE_RECOVERY_MS)
+    {
+      startFixedRecovery("front_obstacle_timeout");
+      return true;
+    }
+
+    if (newlyBlocked || millis() - lastSensorStatusMs >= SENSOR_STATUS_INTERVAL_MS)
     {
       Serial.print("OBSTACLE_STOP | Front=");
       printDistance(ultrasonicSensors[0].distanceCm);
@@ -2402,7 +2625,6 @@ bool handleFrontObstacle()
       Serial.println("cm. Holding until clear.");
     }
 
-    frontObstacleHolding = true;
     return true;
   }
 
@@ -2564,6 +2786,9 @@ void enterState(RobotState nextState)
       wallPdLastError = 0.0;
       wallPdLastMs = millis();
       wallPdHasLast = false;
+      wallAppliedBaseSpeed = WALL_FORWARD_SPEED;
+      wallSpeedRampLastMs = millis();
+      wallLineReacquireSinceMs = 0;
       copyEncoderCounts(wallFollowLastEncoderCounts);
       wallFollowLastDebugMs = 0;
       printStateThrottled();
@@ -2850,7 +3075,9 @@ void senseLineStep()
 
   if (allowRightAngle)
   {
-    int turnDirection = rightAngleTurnDirectionRequested();
+    int turnDirection = returnModeActive
+                            ? returnCornerTurnDirectionRequested()
+                            : rightAngleTurnDirectionRequested();
     if (turnDirection < 0)
     {
       handleLeftRightAngleDecision();
@@ -2943,6 +3170,10 @@ void correctionStep()
   int16_t correctionSpeed = postTurnFineLineActive()
                                 ? POST_TURN_FINE_CORRECTION_SPEED
                                 : max(PIVOT_SPEED, MIN_CORRECTION_SPEED);
+  if (fieldNavigationActive())
+  {
+    correctionSpeed = max((int16_t)360, scaledSpeed(correctionSpeed, FIELD_TURN_SPEED_PERCENT));
+  }
 
   if (millis() - stateStartMs >= activeCorrectionPulseMs)
   {
@@ -3020,17 +3251,19 @@ float calibratedTiltMagnitudeDeg()
 
 int16_t rightAngleSpeedForError(float remainingDeg)
 {
+  int16_t speed = RIGHT_ANGLE_FINE_SPEED;
   if (remainingDeg > RIGHT_ANGLE_MID_REMAINING_DEG)
   {
-    return RIGHT_ANGLE_FAST_SPEED;
+    speed = RIGHT_ANGLE_FAST_SPEED;
   }
-
-  if (remainingDeg > RIGHT_ANGLE_FINE_REMAINING_DEG)
+  else if (remainingDeg > RIGHT_ANGLE_FINE_REMAINING_DEG)
   {
-    return RIGHT_ANGLE_MID_SPEED;
+    speed = RIGHT_ANGLE_MID_SPEED;
   }
 
-  return RIGHT_ANGLE_FINE_SPEED;
+  return fieldNavigationActive()
+             ? max((int16_t)300, scaledSpeed(speed, FIELD_TURN_SPEED_PERCENT))
+             : speed;
 }
 
 void driveTurnDirection(int direction, int16_t speed)
@@ -3092,7 +3325,10 @@ void beginRightAngleTurn(int direction, float targetDeg)
 
 void beginTurnAround180()
 {
-  int direction = lastTurnDirection < 0 ? 1 : -1;
+  int direction = fixedRecoveryTurnDirection != 0
+                      ? fixedRecoveryTurnDirection
+                      : (lastTurnDirection < 0 ? 1 : -1);
+  fixedRecoveryTurnDirection = 0;
   beginRightAngleTurn(direction, UTURN_TARGET_DEG);
   Serial.println("RECOVERY | Backed up. Starting 180-degree turn.");
 }
@@ -3100,19 +3336,46 @@ void beginTurnAround180()
 void finishRightAngleTurn(const char *reason)
 {
   stopAllMotors();
+  int completedDirection = activeTurnDirection != 0 ? activeTurnDirection : lastTurnDirection;
+  bool completedUTurn = activeTurnTargetDeg >= UTURN_TARGET_DEG - 1.0;
+  if (completedUTurn)
+  {
+    gridHeading = (gridHeading + 2) % 4;
+  }
+  else if (completedDirection > 0)
+  {
+    gridHeading = (gridHeading + 1) % 4;
+  }
+  else if (completedDirection < 0)
+  {
+    gridHeading = (gridHeading + 3) % 4;
+  }
 
   Serial.print("TURN | ");
   Serial.print(reason);
   Serial.print(" delta=");
   Serial.print(rightAngleTurnDeg(), 2);
   Serial.print(" error=");
-  Serial.println(rightAngleTurnErrorDeg(), 2);
+  Serial.print(rightAngleTurnErrorDeg(), 2);
+  Serial.print(" heading=");
+  Serial.println(gridHeading);
+  lastTurnDirection = completedDirection;
 
-  if (activeTurnTargetDeg >= UTURN_TARGET_DEG - 1.0)
+  if (completedUTurn)
   {
     activeTurnDirection = 0;
     pendingTurnDirection = 0;
     turnLineAbortExtraActive = false;
+    if (fixedRecoveryActive)
+    {
+      fixedRecoveryActive = false;
+      noLineTargetYawDeg = yawDeg;
+      noLineYawTargetLocked = true;
+      ignoreRightAngleUntilMs = millis() + 800;
+      Serial.println("RECOVERY_FIXED | U-turn complete. Entering offline/no-line navigation.");
+      enterState(wallFollowingAllowed() ? WALL_FOLLOW : NO_LINE_IMU_FORWARD);
+      return;
+    }
     enterState(AFTER_TURN_SETTLE);
     return;
   }
@@ -3261,7 +3524,18 @@ void rightAngleTurnStep(bool turnLeft)
     pendingTurnDirection = 0;
     activeTurnDirection = 0;
     turnLineAbortExtraActive = false;
-    enterState(LINE_LOST_STOP);
+    if (fixedRecoveryActive)
+    {
+      fixedRecoveryActive = false;
+      noLineTargetYawDeg = yawDeg;
+      noLineYawTargetLocked = true;
+      Serial.println("RECOVERY_FIXED | Recovery turn timed out. Continue cautiously in no-line mode.");
+      enterState(wallFollowingAllowed() ? WALL_FOLLOW : NO_LINE_IMU_FORWARD);
+    }
+    else
+    {
+      startFixedRecovery("turn_timeout");
+    }
     return;
   }
 
@@ -3312,8 +3586,10 @@ void rightAngleTurnStep(bool turnLeft)
       break;
 
     case RIGHT_ANGLE_RELIEF_FORWARD:
-      speedCommand = RIGHT_ANGLE_RELIEF_SPEED;
-      driveForward(RIGHT_ANGLE_RELIEF_SPEED);
+      speedCommand = fieldNavigationActive()
+                         ? max((int16_t)300, scaledSpeed(RIGHT_ANGLE_RELIEF_SPEED, FIELD_TURN_SPEED_PERCENT))
+                         : RIGHT_ANGLE_RELIEF_SPEED;
+      driveForward(speedCommand);
       if (now - rightAnglePhaseStartMs >= RIGHT_ANGLE_RELIEF_PULSE_MS)
       {
         stopAllMotors();
@@ -3324,8 +3600,10 @@ void rightAngleTurnStep(bool turnLeft)
       break;
 
     case RIGHT_ANGLE_RELIEF_BACKWARD:
-      speedCommand = -RIGHT_ANGLE_RELIEF_SPEED;
-      driveForward(-RIGHT_ANGLE_RELIEF_SPEED);
+      speedCommand = fieldNavigationActive()
+                         ? -max((int16_t)300, scaledSpeed(RIGHT_ANGLE_RELIEF_SPEED, FIELD_TURN_SPEED_PERCENT))
+                         : -RIGHT_ANGLE_RELIEF_SPEED;
+      driveForward(speedCommand);
       if (now - rightAnglePhaseStartMs >= RIGHT_ANGLE_RELIEF_PULSE_MS)
       {
         stopAllMotors();
@@ -3372,7 +3650,7 @@ void rightAngleTurnStep(bool turnLeft)
       }
       else
       {
-        speedCommand = RIGHT_ANGLE_FINE_SPEED;
+        speedCommand = rightAngleSpeedForError(fabs(error));
         driveTurnDirection(fineTurnDirection, speedCommand);
       }
       break;
@@ -3416,7 +3694,9 @@ void postTurnForwardVerifyStep()
 
   if (elapsedMs >= POST_TURN_VERIFY_MS)
   {
-    if (postTurnMaxTiltDeltaDeg < POST_TURN_MIN_TILT_DELTA_DEG)
+    bool slopeVerificationActive = uphillTunnelPhaseReached() || returnTunnelActive;
+    if (slopeVerificationActive &&
+        postTurnMaxTiltDeltaDeg < POST_TURN_MIN_TILT_DELTA_DEG)
     {
       startPostTurnRecovery("no_slope_detected");
       return;
@@ -3428,7 +3708,9 @@ void postTurnForwardVerifyStep()
       return;
     }
 
-    Serial.print("POST_TURN | Slope detected. tiltDelta=");
+    Serial.print(slopeVerificationActive
+                     ? "POST_TURN | Slope transition verified. tiltDelta="
+                     : "POST_TURN | Flat-field verify complete. tiltDelta=");
     Serial.println(postTurnMaxTiltDeltaDeg, 2);
     enterState(AFTER_TURN_SETTLE);
     return;
@@ -3441,7 +3723,7 @@ void postTurnForwardVerifyStep()
   }
   else
   {
-    driveForward(POST_TURN_VERIFY_SPEED);
+    driveForward(fieldNavigationActive() ? FIELD_POST_TURN_VERIFY_SPEED : POST_TURN_VERIFY_SPEED);
   }
 }
 
@@ -3454,7 +3736,9 @@ void postTurnBackUpStep()
     return;
   }
 
-  driveForward(-POST_TURN_BACKUP_SPEED);
+  driveForward(fieldNavigationActive()
+                   ? -max((int16_t)420, scaledSpeed(POST_TURN_BACKUP_SPEED, FIELD_TURN_SPEED_PERCENT))
+                   : -POST_TURN_BACKUP_SPEED);
 }
 
 void enterFirstFindLineState()
@@ -3628,11 +3912,11 @@ void findLineStep(bool turnLeft, uint16_t timeoutMs, float targetSweepDeg, Robot
 
   if (turnLeft)
   {
-    pivotLeft(FIND_LINE_SPEED);
+    pivotLeft(fieldNavigationActive() ? FIELD_FIND_LINE_SPEED : FIND_LINE_SPEED);
   }
   else
   {
-    pivotRight(FIND_LINE_SPEED);
+    pivotRight(fieldNavigationActive() ? FIELD_FIND_LINE_SPEED : FIND_LINE_SPEED);
   }
 }
 
@@ -3688,11 +3972,11 @@ void noLineReturnYawStep()
 
   if (yawError > 0.0)
   {
-    pivotLeft(NO_LINE_RETURN_YAW_SPEED);
+    pivotLeft(fieldNavigationActive() ? FIELD_FIND_LINE_SPEED : NO_LINE_RETURN_YAW_SPEED);
   }
   else
   {
-    pivotRight(NO_LINE_RETURN_YAW_SPEED);
+    pivotRight(fieldNavigationActive() ? FIELD_FIND_LINE_SPEED : NO_LINE_RETURN_YAW_SPEED);
   }
 }
 
@@ -3726,24 +4010,30 @@ void noLineImuForwardStep()
 
   if (!USE_IMU)
   {
-    driveForward(NO_LINE_FORWARD_SPEED);
+    driveForward(fieldNavigationActive() ? FIELD_NO_LINE_FORWARD_SPEED : NO_LINE_FORWARD_SPEED);
     return;
   }
 
+  int16_t noLineForwardSpeed = fieldNavigationActive()
+                                   ? FIELD_NO_LINE_FORWARD_SPEED
+                                   : NO_LINE_FORWARD_SPEED;
   float yawError = normalizedYawErrorDeg(yawDeg, noLineTargetYawDeg);
+  int16_t yawMaxCorrection = fieldNavigationActive()
+                                 ? FIELD_NO_LINE_YAW_MAX_CORRECTION
+                                 : NO_LINE_YAW_MAX_CORRECTION;
   int16_t correction = constrain(
       (int16_t)(yawError * NO_LINE_YAW_KP),
-      -NO_LINE_YAW_MAX_CORRECTION,
-      NO_LINE_YAW_MAX_CORRECTION);
+      -yawMaxCorrection,
+      yawMaxCorrection);
 
   int16_t leftSpeed = constrain(
-      (int16_t)(NO_LINE_FORWARD_SPEED + correction),
-      (int16_t)(NO_LINE_FORWARD_SPEED - NO_LINE_YAW_MAX_CORRECTION),
-      (int16_t)(NO_LINE_FORWARD_SPEED + NO_LINE_YAW_MAX_CORRECTION));
+      (int16_t)(noLineForwardSpeed + correction),
+      (int16_t)(noLineForwardSpeed - yawMaxCorrection),
+      (int16_t)(noLineForwardSpeed + yawMaxCorrection));
   int16_t rightSpeed = constrain(
-      (int16_t)(NO_LINE_FORWARD_SPEED - correction),
-      (int16_t)(NO_LINE_FORWARD_SPEED - NO_LINE_YAW_MAX_CORRECTION),
-      (int16_t)(NO_LINE_FORWARD_SPEED + NO_LINE_YAW_MAX_CORRECTION));
+      (int16_t)(noLineForwardSpeed - correction),
+      (int16_t)(noLineForwardSpeed - yawMaxCorrection),
+      (int16_t)(noLineForwardSpeed + yawMaxCorrection));
 
   driveBySide(leftSpeed, rightSpeed);
 }
@@ -3763,27 +4053,69 @@ void wallFollowStep()
   readSensors();
   printSensors("WALL");
 
-  if (anySensorOnLine())
+  if (returnTunnelActive && !anySensorOnLine())
   {
-    if (uphillLineIgnoreActive())
+    returnTunnelSawNoLine = true;
+  }
+
+  bool stableFieldLineCandidate =
+      millis() - stateStartMs >= WALL_LINE_REACQUIRE_MIN_MS &&
+      (!returnTunnelActive || returnTunnelSawNoLine) &&
+      sensorOnLine[SENSOR_MIDDLE];
+  if (stableFieldLineCandidate)
+  {
+    if (wallLineReacquireSinceMs == 0)
     {
-      // Stay in wall/yaw-hold mode while crossing the broken line at the slope mouth.
+      wallLineReacquireSinceMs = millis();
+      Serial.println(returnTunnelActive
+                         ? "WALL | Center line candidate detected; confirming base-side line."
+                         : "WALL | Center line candidate detected; confirming field entry.");
     }
-    else if (recordUphillLineFlicker(true, "WALL_FOUND"))
+    else if (millis() - wallLineReacquireSinceMs >= WALL_LINE_REACQUIRE_STABLE_MS)
     {
       stopAllMotors();
-      enterState(NO_LINE_RETURN_YAW);
-      return;
-    }
-    else
-    {
-      stopAllMotors();
-      ignoreRightAngleUntilMs = millis();
-      Serial.println("WALL | Line detected, switching to line following.");
+      uphillLineIgnoreUntilMs = 0;
+      uphillLineFlickerHasLast = false;
+      uphillLineFlickerTransitions = 0;
+      uphillLineFlickerWindowStartMs = 0;
+      airlockRouteTracking = false;
+      airlockRouteTurns = 0;
+      airlockDirectTunnelEntryArmed = false;
+      noLineYawTargetLocked = false;
+      ignoreRightAngleUntilMs = millis() + 250;
+      resetLinePid();
+      if (returnTunnelActive)
+      {
+        returnTunnelActive = false;
+        returnTunnelSawNoLine = false;
+        returnModeActive = false;
+        returnPlanPending = false;
+        returnPositionKnown = false;
+        fieldModeActive = false;
+        returnBaseReacquireSettleActive = true;
+        ignoreRightAngleUntilMs = millis() + RETURN_BASE_IGNORE_TURN_MS;
+        ignoreFrontObstacleUntilMs = millis() + RETURN_BASE_FINE_LINE_MS;
+        postTurnFineLineUntilMs = millis() + RETURN_BASE_FINE_LINE_MS;
+        Serial.println("RETURN | Tunnel complete. Base center line acquired; stop, settle, then lock onto PID line follow.");
+        enterState(SENSOR_SETTLE);
+        return;
+      }
+      else
+      {
+        fieldModeActive = true;
+        Serial.println("WALL | Stable center line confirmed. Field entered; PID line following restored.");
+      }
       enterState(SENSE_LINE);
       return;
     }
   }
+  else
+  {
+    wallLineReacquireSinceMs = 0;
+  }
+
+  // Ignore edge hits and brief broken-line flicker. Wall-follow exits only
+  // after the middle sensor confirms a stable line above.
 
   float leftCm = ultrasonicSensors[1].distanceCm;
   float rightCm = ultrasonicSensors[2].distanceCm;
@@ -3798,13 +4130,15 @@ void wallFollowStep()
   bool sideCritical = (leftCm > 0.0 && leftCm <= WALL_SIDE_CRITICAL_CM) ||
                       (rightCm > 0.0 && rightCm <= WALL_SIDE_CRITICAL_CM);
 
-  if (frontValid && frontCm <= WALL_FRONT_STOP_CM)
+  bool uphillDoorHold = frontValid &&
+                        frontCm <= WALL_FRONT_STOP_CM &&
+                        !returnTunnelActive;
+  if (frontValid && frontCm <= WALL_FRONT_STOP_CM && returnTunnelActive)
   {
-    stopAllMotors();
     Serial.print("WALL | Front close ");
     printDistance(frontCm);
-    Serial.println("cm. Stop wall-follow and search for line.");
-    enterNoLineFindState();
+    Serial.println("cm. Start fixed backup/U-turn recovery.");
+    startFixedRecovery("wall_front_close");
     return;
   }
 
@@ -3873,26 +4207,62 @@ void wallFollowStep()
       (int16_t)-WALL_PD_MAX_CORRECTION,
       (int16_t) WALL_PD_MAX_CORRECTION);
 
-  int16_t wallBaseSpeed = WALL_FORWARD_SPEED;
+  bool climbPowerActive = millis() - stateStartMs < WALL_CLIMB_POWER_MS;
+  int16_t wallCruiseSpeed = climbPowerActive ? WALL_FORWARD_SPEED : WALL_FIELD_APPROACH_SPEED;
+  int16_t wallMinimumSpeed = climbPowerActive ? WALL_MIN_DRIVE_SPEED : WALL_FIELD_APPROACH_MIN_SPEED;
+  int16_t wallTargetSpeed = wallCruiseSpeed;
   if (frontValid && frontCm < WALL_FRONT_SLOW_CM)
   {
     float ratio = (frontCm - WALL_FRONT_STOP_CM) / (WALL_FRONT_SLOW_CM - WALL_FRONT_STOP_CM);
     ratio = constrain(ratio, 0.0, 1.0);
-    wallBaseSpeed = (int16_t)(WALL_MIN_DRIVE_SPEED +
-                              ratio * (WALL_FORWARD_SPEED - WALL_MIN_DRIVE_SPEED));
+    int16_t approachMinimum = returnTunnelActive
+                                  ? wallMinimumSpeed
+                                  : WALL_UPHILL_DOOR_HOLD_SPEED;
+    wallTargetSpeed = (int16_t)(approachMinimum +
+                                ratio * (wallCruiseSpeed - approachMinimum));
   }
-  if (sideCritical && wallBaseSpeed > WALL_MIN_DRIVE_SPEED)
+  if (uphillDoorHold)
   {
-    wallBaseSpeed = WALL_MIN_DRIVE_SPEED;
+    wallTargetSpeed = WALL_UPHILL_DOOR_HOLD_SPEED;
   }
+  if (sideCritical && wallTargetSpeed > wallMinimumSpeed)
+  {
+    wallTargetSpeed = wallMinimumSpeed;
+  }
+
+  float rampDtSec = wallSpeedRampLastMs == 0
+                        ? 0.02
+                        : (float)(now - wallSpeedRampLastMs) / 1000.0;
+  rampDtSec = constrain(rampDtSec, 0.005, 0.2);
+  float maxSpeedChange = (wallTargetSpeed < wallAppliedBaseSpeed
+                              ? WALL_SPEED_DECEL_PER_SEC
+                              : WALL_SPEED_ACCEL_PER_SEC) *
+                         rampDtSec;
+  if (fabs((float)wallTargetSpeed - wallAppliedBaseSpeed) <= maxSpeedChange)
+  {
+    wallAppliedBaseSpeed = wallTargetSpeed;
+  }
+  else if (wallTargetSpeed < wallAppliedBaseSpeed)
+  {
+    wallAppliedBaseSpeed -= maxSpeedChange;
+  }
+  else
+  {
+    wallAppliedBaseSpeed += maxSpeedChange;
+  }
+  wallSpeedRampLastMs = now;
+  int16_t wallBaseSpeed = (int16_t)wallAppliedBaseSpeed;
+  int16_t wheelMinimumSpeed = uphillDoorHold || (!returnTunnelActive && frontValid && frontCm < WALL_FRONT_SLOW_CM)
+                                  ? max((int16_t)160, (int16_t)(wallBaseSpeed - 100))
+                                  : wallMinimumSpeed;
 
   int16_t leftSpeed = constrain(
       (int16_t)(wallBaseSpeed + correction),
-      (int16_t)WALL_MIN_DRIVE_SPEED,
+      wheelMinimumSpeed,
       (int16_t)MAX_SPEED);
   int16_t rightSpeed = constrain(
       (int16_t)(wallBaseSpeed - correction),
-      (int16_t)WALL_MIN_DRIVE_SPEED,
+      wheelMinimumSpeed,
       (int16_t)MAX_SPEED);
 
   driveBySide(leftSpeed, rightSpeed);
@@ -3915,6 +4285,12 @@ void wallFollowStep()
     Serial.print(correction);
     Serial.print(" base=");
     Serial.print(wallBaseSpeed);
+    Serial.print(" target=");
+    Serial.print(wallTargetSpeed);
+    Serial.print(" doorHold=");
+    Serial.print(uphillDoorHold ? "Y" : "N");
+    Serial.print(" climbPower=");
+    Serial.print(climbPowerActive ? "Y" : "N");
     Serial.print(" critical=");
     Serial.print(sideCritical ? "Y" : "N");
     Serial.print(" speedL=");
@@ -4102,12 +4478,48 @@ void updateSeedPlanter()
 
 void startPostPlantRandomAction()
 {
-  int action = random(0, 3);
   stopAllMotors();
+  readSensors();
+  printSensorsNow("POST_PLANT_DECIDE");
+
+  bool lineSeen = anySensorOnLine();
+  bool leftBranchSeen =
+      sensorValues[SENSOR_SLIGHT_LEFT] >= T_JUNCTION_SIDE_THRESHOLD &&
+      sensorValues[SENSOR_LEFT] >= T_JUNCTION_SIDE_THRESHOLD;
+  bool rightBranchSeen =
+      sensorValues[SENSOR_RIGHT] >= T_JUNCTION_SIDE_THRESHOLD &&
+      sensorValues[SENSOR_SLIGHT_RIGHT] >= T_JUNCTION_SIDE_THRESHOLD;
+
+  if (!lineSeen)
+  {
+    Serial.println("PLANTER | No line after seed. Search slowly before choosing a route.");
+    enterNoLineFindState();
+    return;
+  }
+
+  // Turns are allowed only when the reflectance array can prove that branch
+  // exists. At a real junction, bias toward turning to improve exploration.
+  int action = random(0, 4);
+  if (leftBranchSeen && rightBranchSeen)
+  {
+    action = random(0, 2) == 0 ? 1 : 2;
+  }
+  else if (leftBranchSeen && action != 0)
+  {
+    action = 1;
+  }
+  else if (rightBranchSeen && action != 0)
+  {
+    action = 2;
+  }
+  else
+  {
+    action = 0;
+  }
 
   if (action == 0)
   {
-    Serial.println("PLANTER | Random action after seed: STRAIGHT_LINE");
+    Serial.println("PLANTER | Safe action after seed: FOLLOW_LINE");
     ignoreRightAngleUntilMs = millis() + 600;
     enterState(SENSE_LINE);
     return;
@@ -4115,13 +4527,13 @@ void startPostPlantRandomAction()
 
   if (action == 1)
   {
-    Serial.println("PLANTER | Random action after seed: LEFT_90");
+    Serial.println("PLANTER | Confirmed left branch after seed: LEFT_90");
     pendingTurnDirection = -1;
     enterState(TURN_LEFT_90);
     return;
   }
 
-  Serial.println("PLANTER | Random action after seed: RIGHT_90");
+  Serial.println("PLANTER | Confirmed right branch after seed: RIGHT_90");
   pendingTurnDirection = 1;
   enterState(TURN_RIGHT_90);
 }
@@ -4252,17 +4664,94 @@ bool readRFIDCard(uint32_t &uidHash, bool printCard)
   return true;
 }
 
+void planEmergencyReturn()
+{
+  returnPlanPending = false;
+  stopAllMotors();
+  if (!returnPositionKnown)
+  {
+    Serial.println("RETURN | Position unknown. Move cautiously and query next RFID.");
+    ignoreRightAngleUntilMs = millis() + 1200;
+    enterState(SENSE_LINE);
+    return;
+  }
+
+  if (returnGridX == RETURN_EXIT_X && returnGridY == RETURN_EXIT_Y)
+  {
+    Serial.println("RETURN | Exit (9,7) reached. Enter tunnel wall-follow.");
+    returnTunnelActive = true;
+    returnTunnelSawNoLine = false;
+    fieldModeActive = false;
+    airlockRouteTracking = true;
+    airlockRouteTurns = AIRLOCK_UPHILL_ROUTE_TURNS;
+    noLineTargetYawDeg = yawDeg;
+    noLineYawTargetLocked = true;
+    enterState(WALL_FOLLOW);
+    return;
+  }
+
+  int8_t desiredHeading = gridHeading;
+  if (returnGridY < RETURN_EXIT_Y)
+  {
+    desiredHeading = 0;
+  }
+  else if (returnGridY > RETURN_EXIT_Y)
+  {
+    desiredHeading = 2;
+  }
+  else if (returnGridX < RETURN_EXIT_X)
+  {
+    desiredHeading = 1;
+  }
+  else if (returnGridX > RETURN_EXIT_X)
+  {
+    desiredHeading = 3;
+  }
+
+  uint8_t delta = (desiredHeading - gridHeading + 4) % 4;
+  Serial.print("RETURN | plan pos=");
+  Serial.print(returnGridX);
+  Serial.print(",");
+  Serial.print(returnGridY);
+  Serial.print(" heading=");
+  Serial.print(gridHeading);
+  Serial.print(" desired=");
+  Serial.println(desiredHeading);
+
+  if (delta == 0)
+  {
+    noLineTargetYawDeg = yawDeg;
+    noLineYawTargetLocked = true;
+    ignoreRightAngleUntilMs = millis() + 1800;
+    enterState(SENSE_LINE);
+  }
+  else if (delta == 1)
+  {
+    enterState(TURN_RIGHT_90);
+  }
+  else if (delta == 3)
+  {
+    enterState(TURN_LEFT_90);
+  }
+  else
+  {
+    enterState(TURN_AROUND_180);
+  }
+}
+
 void startRFIDPause()
 {
   bool firstCard = !rfidFirstCardSeen;
   rfidFirstCardSeen = true;
-  if (firstCard)
+  if (firstCard && !returnModeActive)
   {
     startAirlockUphillRouteTracking(USE_SERVER_MESSENGER ? "FIRST_RFID_AIRLOCK" : "FIRST_RFID_LOCAL");
   }
   rfidPauseShouldPlant = !firstCard;
   rfidReturnState = state == RFID_PAUSE ? SENSE_LINE : state;
   lastRFIDActionMs = millis();
+  lastRFIDActionUidHash = lastRFIDUidHash;
+  haveLastRFIDActionUid = haveLastRFIDUid;
   copyText(activeRFIDTagId, sizeof(activeRFIDTagId), lastRFIDTagId);
   serverRfidRequest = SERVER_RFID_NONE;
   serverRfidReplyReceived = false;
@@ -4277,7 +4766,7 @@ void startRFIDPause()
   bool serverReady = USE_SERVER_MESSENGER && serverMessengerStarted && serverMessenger.isConnected();
   if (serverReady)
   {
-    if (firstCard)
+    if (firstCard && !returnModeActive)
     {
       rfidPauseShouldPlant = false;
       serverRfidRequest = SERVER_RFID_WAIT_AIRLOCK;
@@ -4343,6 +4832,17 @@ void handleRFIDPauseState()
     return;
   }
 
+  if (returnModeActive)
+  {
+    rfidPauseShouldPlant = false;
+    serverRfidRequest = SERVER_RFID_NONE;
+    serverShouldReportCurrentPlant = false;
+    returnPlanPending = true;
+    Serial.println("RETURN | RFID pause complete; skip planting and replan.");
+    enterState(SENSE_LINE);
+    return;
+  }
+
   if (rfidPauseShouldPlant)
   {
     bool started = triggerSeedPlanter(serverShouldReportCurrentPlant ? "RFID_SERVER" : "RFID_LOCAL");
@@ -4395,6 +4895,25 @@ void updateRFID()
     return;
   }
 
+  // A tag remains underneath the reader while pivoting on a node. Pausing a
+  // turn here resets its IMU target and can trap the robot spinning over the
+  // same tag instead of completing the turn and reacquiring the line.
+  switch (state)
+  {
+    case PRE_TURN_FORWARD_LEFT:
+    case PRE_TURN_FORWARD_RIGHT:
+    case TURN_LEFT_90:
+    case TURN_RIGHT_90:
+    case TURN_AROUND_180:
+    case POST_TURN_FORWARD_VERIFY:
+    case POST_TURN_BACK_UP:
+    case AFTER_TURN_SETTLE:
+      return;
+
+    default:
+      break;
+  }
+
   if (USE_GRID_OBSTACLE_AVOIDANCE &&
       gridObstacleAvoidanceAllowed() &&
       gridObstacleDetectedAhead(ultrasonicSensors[0].distanceCm))
@@ -4415,8 +4934,15 @@ void updateRFID()
   lastRFIDCheckMs = millis();
 
   uint32_t uidHash = 0;
-  if (readRFIDCard(uidHash, true))
+  if (readRFIDCard(uidHash, false))
   {
+    if (haveLastRFIDActionUid &&
+        uidHash == lastRFIDActionUidHash &&
+        millis() - lastRFIDActionMs < RFID_SAME_CARD_ACTION_COOLDOWN_MS)
+    {
+      return;
+    }
+
     startRFIDPause();
   }
 }
@@ -5135,8 +5661,9 @@ void setup()
   Serial.println("Correction enabled: 5 reflectance sensors; IMU right-angle turns enabled.");
   Serial.println("WALL | If no black line is detected, follow tunnel wall at 15cm until line returns.");
   Serial.println("GRID_OBS | Disabled in main. Use env:grid_obstacle_avoidance for standalone obstacle test.");
-  Serial.println("MECH | Startup waits with motors stopped and blinking red. Press D45 once to run.");
+  Serial.println("MECH | Startup waits stopped: red slow blink=no WiFi/server, fast blink=connected. Press D45 once to run.");
   Serial.println("MECH | After startup, D45 toggles movement stop/run. D32 revives/resumes and sets LED green.");
+  Serial.println("MECH | Emergency warning overrides LEDs with alternating red/green blink.");
   Serial.println(USE_RFID ? "RFID | Enabled on SDA1/SCL1, address 0x28." : "RFID | Disabled.");
   Serial.println("US | Front E37/T39, Left E52/T44, Right E46/T48.");
   delay(1000);
@@ -5198,6 +5725,11 @@ void loop()
     return;
   }
 
+  if (returnPlanPending)
+  {
+    planEmergencyReturn();
+  }
+
   if (obstacleAvoidanceAllowed() && handleFrontObstacle()){
     printSensorStatus();
     delay(5);
@@ -5215,7 +5747,11 @@ void loop()
         break;
       }
 
-      int16_t forwardSpeed = postTurnFineLineActive() ? POST_TURN_FINE_FORWARD_SPEED : FORWARD_SPEED;
+      int16_t forwardSpeed = postTurnFineLineActive()
+                                 ? (fieldNavigationActive()
+                                        ? FIELD_POST_TURN_FINE_FORWARD_SPEED
+                                        : POST_TURN_FINE_FORWARD_SPEED)
+                                 : (fieldNavigationActive() ? FIELD_FORWARD_SPEED : FORWARD_SPEED);
       uint16_t forwardPulseMs = postTurnFineLineActive() ? POST_TURN_FINE_FORWARD_PULSE_MS : FORWARD_PULSE_MS;
 
       driveForward(forwardSpeed);
@@ -5228,7 +5764,14 @@ void loop()
 
     case SENSOR_SETTLE:
       stopAllMotors();
-      if (millis() - stateStartMs >= SENSOR_SETTLE_MS){
+      if (millis() - stateStartMs >=
+          (returnBaseReacquireSettleActive ? RETURN_BASE_REACQUIRE_SETTLE_MS : SENSOR_SETTLE_MS)){
+        if (returnBaseReacquireSettleActive)
+        {
+          returnBaseReacquireSettleActive = false;
+          resetLinePid();
+          Serial.println("RETURN | Base settle complete. PID line following active; corner detection temporarily locked.");
+        }
         enterState(SENSE_LINE);
       }
       break;
@@ -5264,7 +5807,7 @@ void loop()
       break;
 
     case PRE_TURN_FORWARD_LEFT:
-      driveForward(FORWARD_SPEED);
+      driveForward(fieldNavigationActive() ? FIELD_FORWARD_SPEED : FORWARD_SPEED);
       if (millis() - stateStartMs >= activePreTurnForwardLeftMs())
       {
         stopAllMotors();
@@ -5273,7 +5816,7 @@ void loop()
       break;
 
     case PRE_TURN_FORWARD_RIGHT:
-      driveForward(FORWARD_SPEED);
+      driveForward(fieldNavigationActive() ? FIELD_FORWARD_SPEED : FORWARD_SPEED);
       if (millis() - stateStartMs >= PRE_TURN_FORWARD_RIGHT_MS)
       {
         stopAllMotors();
@@ -5336,6 +5879,10 @@ void loop()
       break;
     case LINE_LOST_STOP:
       stopAllMotors();
+      if (millis() - stateStartMs >= LINE_LOST_STOP_RECOVERY_MS)
+      {
+        startFixedRecovery("line_lost_stop");
+      }
       break;
   }
 
