@@ -39,12 +39,9 @@ PlatformIO installs these from `lib_deps`:
 - `Servo`.
 - Built-in `Arduino` and `Wire`.
 
-Secrets Configuration
+Header File Configuration
 
-Keep `secrets.h` in the same sketch folder as the final `.ino` file.
-
-Do not commit real Wi-Fi, broker, team, or board credentials. Use a private local
-file like this:
+Keep `secrets.h` in the same sketch folder as the final `.cpp` file.
 #define WIFI_SSID "PhaseSpaceNetwork_2.4G"
 #define WIFI_PASSWORD "8igMacNet"
 #define BROKER_HOST "192.168.0.74"
