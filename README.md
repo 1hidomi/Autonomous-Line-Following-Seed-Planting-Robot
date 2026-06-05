@@ -14,7 +14,6 @@ review.
 GitHub submission snapshot:
 
 ```text
-.
 |-- main.cpp                         # Integrated competition controller
 |-- Field_planting_seed.cpp          # Standalone field planting controller
 |-- Return_Base.cpp                  # Standalone emergency return test
