@@ -41,8 +41,6 @@ The codebase is developed as a **PlatformIO** project. The public GitHub reposit
 | `flowcharts/`                   | Flowcharts for major robot behaviours                         |
 | `Testing_Calibration_Evidence/` | Logs, screenshots, calibration records, and field-test videos |
 
-> **Security note:** Do not commit a real `secrets.h` file to a public repository. Add it to `.gitignore` and provide a safe template such as `secrets.example.h`.
-
 ## Main Controller Behaviour
 
 The integrated controller:
@@ -412,16 +410,6 @@ Recommended evidence includes:
   * RFID detection;
   * seed planting.
 
-## Safety Notes
-
-* Test with the wheels raised during initial motor checks.
-* Keep hands away from moving mechanisms.
-* Verify the D45 stop/run toggle before every field test.
-* Confirm that remote disable and emergency commands stop normal operation.
-* Do not test autonomous return behaviour near stairs, table edges, or pedestrians.
-* Disconnect motor power before modifying wiring.
-* Never publish live network passwords or private broker credentials.
-
 ## Known Limitations
 
 * Robot performance depends on reflectance and ultrasonic calibration for the test environment.
@@ -430,15 +418,3 @@ Recommended evidence includes:
 * Network loss may prevent online checkpoint handling.
 * Line-loss recovery depends on the robot's previous direction and surrounding geometry.
 * Emergency route planning assumes that the robot's internal grid position remains accurate.
-
-## Future Improvements
-
-* Add automatic reflectance calibration.
-* Improve IMU drift compensation.
-* Add timeout and retry logic for every server request.
-* Persist the current grid state across resets.
-* Add more robust RFID duplicate detection.
-* Introduce formal navigation-state logging.
-* Add unit tests for message parsing and route planning.
-* Store testing data in structured CSV or JSON files.
-* Add continuous-integration compilation for every GitHub push.
