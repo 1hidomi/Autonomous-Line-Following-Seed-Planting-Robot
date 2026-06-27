@@ -21,7 +21,7 @@ The codebase is developed as a **PlatformIO** project. The public GitHub reposit
 ├── planting.cpp
 ├── return_to_base.cpp
 ├── platform_io/
-├── secrets.example.h
+├── secrets.h
 ├── software_overview_diagram.png
 ├── flowcharts/
 │   ├── mechanical_kill_switch.png
@@ -130,24 +130,12 @@ Do not publish real credentials. Use a local file similar to:
 
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-
 #define BROKER_HOST "YOUR_BROKER_IP"
 #define BROKER_PORT 1883
-
 #define GROUP_ID "YOUR_GROUP_ID"
 #define BOARD_ID "YOUR_BOARD_ID"
 ```
 
-Create a public template called `secrets.example.h` containing placeholders only.
-
-Add the real file to `.gitignore`:
-
-```gitignore
-secrets.h
-.pio/
-.vscode/
-.DS_Store
-```
 
 ## Build and Upload
 
@@ -171,7 +159,6 @@ pio run -t upload
 pio run -e final -t upload
 ```
 
-Replace `final` with the environment name defined in `platformio.ini`.
 
 ### Open the serial monitor
 
@@ -424,30 +411,6 @@ Recommended evidence includes:
   * tunnel wall following;
   * RFID detection;
   * seed planting.
-
-## Suggested Evidence Directory
-
-```text
-Testing_Calibration_Evidence/
-├── build/
-│   └── platformio_compile_success.png
-├── serial_logs/
-│   ├── startup_log.txt
-│   ├── line_following_log.txt
-│   ├── RFID_planting_log.txt
-│   └── emergency_return_log.txt
-├── calibration/
-│   ├── reflectance_sensor_values.csv
-│   ├── imu_calibration.txt
-│   └── ultrasonic_calibration.csv
-├── screenshots/
-└── videos/
-    ├── line_following.mp4
-    ├── u_turn.mp4
-    ├── tunnel_navigation.mp4
-    ├── slope_test.mp4
-    └── planting.mp4
-```
 
 ## Safety Notes
 
