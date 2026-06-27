@@ -1,6 +1,8 @@
-#define WIFI_SSID "PhaseSpaceNetwork_2.4G"
-#define WIFI_PASSWORD "8igMacNet"
-#define BROKER_HOST "192.168.0.74"
-#define BROKER_PORT 1883
-#define GROUP_ID "5"
-#define BOARD_ID "Igor5"
+#pragma once 
+
+#define WIFI_SSID "YOUR_WIFI_SSID" 
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD" 
+#define BROKER_HOST "YOUR_BROKER_IP" 
+#define BROKER_PORT 1883 
+#define GROUP_ID "YOUR_GROUP_ID" 
+#define BOARD_ID "YOUR_BOARD_ID"
